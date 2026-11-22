@@ -83,10 +83,10 @@
   .sort { @apply text-accent; }
   .status { @apply inline-flex gap-1.5 items-center whitespace-nowrap rounded-full bg-[#efeee9] px-2.5 py-1 text-sm text-[#55554c]; }
   .status > span, .signal { @apply inline-block w-2 h-2 rounded-full bg-current shrink-0 align-middle; }
-  .status-inspection, .status-shortage { @apply bg-[#fbefda] text-[#805910]; }
+  .status-on_review, .status-shortage { @apply bg-[#fbefda] text-[#805910]; }
   .status-accepted, .status-planned, .status-completed { @apply bg-[#e9f0e7] text-[#3b684b]; }
   .status-rejected, .status-cancelled { @apply bg-[#f7e8e3] text-[#923e32]; }
-  .status-running { @apply bg-[#e6eef5] text-[#375878]; }
+  .status-in_progress { @apply bg-[#e6eef5] text-[#375878]; }
   .signal { @apply mr-2.5; }
   .signal.green { @apply bg-[#457d59]; }
   .signal.yellow { @apply bg-[#bd831a]; }

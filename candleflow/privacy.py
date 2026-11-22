@@ -77,9 +77,19 @@ class Pseudonyms:
     def mask(self, value: Any) -> Any:
         if isinstance(value, str):
             value = unicodedata.normalize("NFKC", value)
+            matches: dict[tuple[int, int], set[str]] = {}
             for pattern, alias in self.rules:
-                value = pattern.sub(alias, value)
-            return value
+                for match in pattern.finditer(value):
+                    matches.setdefault(match.span(), set()).add(alias)
+            parts, cursor = [], 0
+            for (start, end), candidates in sorted(matches.items(), key=lambda row: (row[0][0], -row[0][1])):
+                if start < cursor:
+                    continue
+                parts.append(value[cursor:start])
+                parts.append(next(iter(candidates)) if len(candidates) == 1 else "PERSON_REDACTED")
+                cursor = end
+            parts.append(value[cursor:])
+            return "".join(parts)
         if isinstance(value, dict):
             return {key: self.mask(item) for key, item in value.items() if key != "comment"}
         if isinstance(value, list):
@@ -89,7 +99,7 @@ class Pseudonyms:
     def restore(self, text: str) -> str:
         return re.sub(
             r"(?<!\w)(?:SUPPLIER|EMPLOYEE)_\d+(?!\w)",
-            lambda match: self.originals.get(match[0], match[0]),
+            lambda match: self.originals.get(match[0].upper(), match[0]),
             text,
             flags=re.IGNORECASE,
         )

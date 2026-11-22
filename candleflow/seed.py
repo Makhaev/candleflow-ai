@@ -32,9 +32,14 @@ def seed(day: date):
         if manager:
             return
         users = [
-            User(login=role, role=role, full_name=name, password_hash=password_hash(DEMO_PASSWORD))
+            User(
+                login="warehouse" if role == "storekeeper" else role,
+                role=role,
+                full_name=name,
+                password_hash=password_hash(DEMO_PASSWORD),
+            )
             for role, name in (
-                ("warehouse", "Петров Иван"),
+                ("storekeeper", "Петров Иван"),
                 ("technologist", "Соколова Анна"),
                 ("manager", "Орлова Елена"),
             )

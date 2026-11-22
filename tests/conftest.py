@@ -28,9 +28,14 @@ def db(postgres):
     with SessionLocal.begin() as connection:
         names = ", ".join(Base.metadata.tables)
         connection.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
-        for role, name in (("manager", "Орлова Елена"), ("warehouse", "Петров Иван")):
+        for role, name in (("manager", "Орлова Елена"), ("storekeeper", "Петров Иван")):
             connection.add(
-                User(login=role, role=role, full_name=name, password_hash=password_hash("testpass"))
+                User(
+                    login="warehouse" if role == "storekeeper" else role,
+                    role=role,
+                    full_name=name,
+                    password_hash=password_hash("testpass"),
+                )
             )
     with SessionLocal() as session:
         yield session

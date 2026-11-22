@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, LargeBinary, UniqueConstraint, func, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, LargeBinary, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,15 +33,20 @@ class Message(Base):
     model: Mapped[str | None]
     tools: Mapped[list] = mapped_column(JSONB, default=list)
     code: Mapped[list] = mapped_column(JSONB, default=list)
+    attempts: Mapped[list] = mapped_column(JSONB, server_default="[]")
+    tool_calls: Mapped[list] = mapped_column(JSONB, server_default="[]")
+    stop_requested: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class Proposal(Base):
-    __tablename__ = "proposals"
+class PendingAction(Base):
+    __tablename__ = "pending_actions"
     message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), primary_key=True)
     args: Mapped[dict] = mapped_column(JSONB)
     recipe: Mapped[str]
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"))
+    action: Mapped[str] = mapped_column(server_default="plan_job")
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

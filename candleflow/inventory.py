@@ -1,6 +1,6 @@
 from collections import defaultdict
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Literal
 
 from fastapi.encoders import jsonable_encoder
@@ -20,11 +20,11 @@ from candleflow.models import (
     Recipe,
     User,
 )
-from candleflow.rates import exchange_rate
+from candleflow.rates import RateQuote, mock_quote
 from candleflow.schemas import Completion, JobInput, MaterialInput, Period, ReceiptInput, RecipeInput
 
 ZERO = Decimal(0)
-READERS = ("warehouse", "technologist", "manager")
+READERS = ("storekeeper", "technologist", "manager")
 PRODUCTION = ("technologist", "manager")
 
 
@@ -54,7 +54,7 @@ def get_or_fail(db: Session, model, key, *, lock: bool = False):
 
 
 def add_material(db: Session, user: User, data: MaterialInput) -> dict:
-    require(user, "warehouse", "manager")
+    require(user, "storekeeper", "manager")
     if db.get(Material, data.code):
         raise DomainError("Материал с таким кодом уже существует")
     material = Material(**data.model_dump())
@@ -77,12 +77,14 @@ def add_recipe(db: Session, user: User, data: RecipeInput) -> dict:
     return serialize(recipe)
 
 
-def receive(db: Session, user: User, receipt: ReceiptInput) -> list[dict]:
-    require(user, "warehouse", "manager")
+def receive(
+    db: Session, user: User, receipt: ReceiptInput, quotes: dict[str, RateQuote] | None = None
+) -> list[dict]:
+    require(user, "storekeeper", "manager")
     batches = []
     for line in receipt.lines:
         get_or_fail(db, Material, line.material_code)
-        rate = exchange_rate(line.currency, receipt.received_on)
+        quote = quotes[line.currency] if quotes else mock_quote(line.currency, receipt.received_on)
         batch = Batch(
             material_code=line.material_code,
             supplier=receipt.supplier,
@@ -91,9 +93,10 @@ def receive(db: Session, user: User, receipt: ReceiptInput) -> list[dict]:
             quantity=line.quantity,
             unit_price=line.unit_price,
             currency=line.currency,
-            exchange_rate=rate,
-            unit_cost=line.unit_price * rate,
-            status="inspection",
+            exchange_rate=quote.rate,
+            exchange_rate_on=quote.day,
+            unit_cost=line.unit_price * quote.rate,
+            status="on_review",
             comment=line.comment,
         )
         db.add(batch)
@@ -103,9 +106,9 @@ def receive(db: Session, user: User, receipt: ReceiptInput) -> list[dict]:
 
 
 def inspect_batch(db: Session, user: User, batch_id: int, status: str) -> dict:
-    require(user, "warehouse", "manager")
+    require(user, "storekeeper", "manager")
     batch = get_or_fail(db, Batch, batch_id, lock=True)
-    if batch.status != "inspection" or status not in ("accepted", "rejected"):
+    if batch.status != "on_review" or status not in ("accepted", "rejected"):
         raise DomainError("Решение по проверке партии уже принято или статус недопустим")
     before = serialize(batch)
     batch.status = status
@@ -146,18 +149,22 @@ def batch_list(
 def stock(db: Session, user: User, material_code: str) -> dict:
     require(user, *READERS)
     material = get_or_fail(db, Material, material_code)
-    total, free = db.execute(
+    accepted = Batch.status == "accepted"
+    physical, total, reserved = db.execute(
         select(
             func.coalesce(func.sum(Batch.quantity), 0),
-            func.coalesce(func.sum(Batch.quantity - Batch.reserved), 0),
-        ).where(Batch.material_code == material_code, Batch.status == "accepted")
+            func.coalesce(func.sum(Batch.quantity).filter(accepted), 0),
+            func.coalesce(func.sum(Batch.reserved).filter(accepted), 0),
+        ).where(Batch.material_code == material_code)
     ).one()
     return {
         "code": material.code,
         "name": material.name,
         "unit": material.unit,
         "total": str(total),
-        "free": str(free),
+        "physical": str(physical),
+        "reserved": str(reserved),
+        "free": str(total - reserved),
     }
 
 
@@ -175,19 +182,38 @@ def recipe_for_plan(db: Session, user: User, data: JobInput) -> Recipe:
     return get_or_fail(db, Recipe, data.recipe_id)
 
 
-def plan(db: Session, user: User, data: JobInput) -> dict:
+def create_draft(db: Session, user: User, data: JobInput) -> dict:
     recipe = recipe_for_plan(db, user, data)
     ingredients = db.scalars(
         select(Ingredient).where(Ingredient.recipe_id == recipe.id).order_by(Ingredient.material_code)
     ).all()
-    job = Job(**data.model_dump(), status="planned")
+    job = Job(**data.model_dump(), status="draft")
     db.add(job)
     db.flush()
     for ingredient in ingredients:
-        code = ingredient.material_code
-        need = ingredient.per_unit * data.quantity
-        db.add(Component(job_id=job.id, material_code=code, required=need))
-        for batch in db.scalars(fifo(code)):
+        db.add(
+            Component(
+                job_id=job.id,
+                material_code=ingredient.material_code,
+                required=ingredient.per_unit * data.quantity,
+            )
+        )
+    audit(db, user, job)
+    return job_detail(db, user, job.id)
+
+
+def plan_draft(db: Session, user: User, job_id: int) -> dict:
+    require(user, *PRODUCTION)
+    job = get_or_fail(db, Job, job_id, lock=True)
+    if job.status != "draft":
+        raise DomainError("Запланировать можно только черновик")
+    before_job = serialize(job)
+    components = db.scalars(
+        select(Component).where(Component.job_id == job_id).order_by(Component.material_code)
+    ).all()
+    for component in components:
+        need = component.required
+        for batch in db.scalars(fifo(component.material_code)):
             take = min(need, batch.quantity - batch.reserved)
             if take:
                 before = serialize(batch)
@@ -197,10 +223,14 @@ def plan(db: Session, user: User, data: JobInput) -> dict:
                 need -= take
             if not need:
                 break
-        if need:
-            job.status = "shortage"
-    audit(db, user, job)
+    job.status = "planned"
+    audit(db, user, job, before_job)
     return job_detail(db, user, job.id)
+
+
+def plan(db: Session, user: User, data: JobInput) -> dict:
+    draft = create_draft(db, user, data)
+    return plan_draft(db, user, draft["id"])
 
 
 def allocations(db: Session, job_id: int) -> list[tuple[Allocation, Batch]]:
@@ -218,9 +248,11 @@ def job_detail(db: Session, user: User, job_id: int) -> dict:
     job = get_or_fail(db, Job, job_id)
     recipe = get_or_fail(db, Recipe, job.recipe_id)
     held: dict[str, Decimal] = defaultdict(Decimal)
+    issued: dict[str, Decimal] = defaultdict(Decimal)
     used: dict[str, Decimal] = defaultdict(Decimal)
     for allocation, batch in allocations(db, job_id):
         held[batch.material_code] += allocation.reserved
+        issued[batch.material_code] += allocation.issued
         used[batch.material_code] += allocation.consumed
     components = []
     rows = db.execute(
@@ -237,8 +269,11 @@ def job_detail(db: Session, user: User, job_id: int) -> dict:
                 "unit": material.unit,
                 "required": str(component.required),
                 "reserved": str(reserved),
+                "issued": str(issued[code]),
                 "consumed": str(used[code]),
-                "missing": str(component.required - reserved),
+                "missing": str(max(ZERO, component.required - reserved - issued[code]))
+                if job.status in {"draft", "planned"}
+                else str(ZERO),
                 "signal": signal,
             }
         )
@@ -250,28 +285,28 @@ def job_transition(db: Session, user: User, job_id: int, action: Literal["start"
     job = get_or_fail(db, Job, job_id, lock=True)
     before = serialize(job)
     if action == "start":
-        if job.status == "shortage":
-            details = job_detail(db, user, job_id)
-            missing = ", ".join(
-                f"{c['missing']} {c['unit']} · {c['name']}"
-                for c in details["components"]
-                if Decimal(c["missing"])
-            )
-            raise DomainError(f"Не хватает сырья для запуска: {missing}")
         if job.status != "planned":
             raise DomainError("Запустить можно только запланированное задание")
-        job.status = "running"
-    else:
-        if job.status not in ("planned", "shortage"):
-            raise DomainError("Отмена доступна только до запуска")
-        for allocation, row in allocations(db, job_id):
-            batch = get_or_fail(db, Batch, row.id, lock=True)
-            db.refresh(batch, with_for_update=True)
-            before_batch = serialize(batch)
-            batch.reserved -= allocation.reserved
-            allocation.reserved = ZERO
-            audit(db, user, batch, before_batch)
-        job.status = "cancelled"
+        details = job_detail(db, user, job_id)
+        missing = ", ".join(
+            f"{c['missing']} {c['unit']} · {c['name']}"
+            for c in details["components"]
+            if Decimal(c["missing"])
+        )
+        if missing:
+            raise DomainError(f"Не хватает сырья для запуска: {missing}")
+    elif job.status not in ("draft", "planned"):
+        raise DomainError("Отмена доступна только до запуска")
+    for allocation, batch in allocations(db, job_id):
+        db.refresh(batch, with_for_update=True)
+        before_batch = serialize(batch)
+        batch.reserved -= allocation.reserved
+        if action == "start":
+            batch.quantity -= allocation.reserved
+            allocation.issued = allocation.reserved
+        allocation.reserved = ZERO
+        audit(db, user, batch, before_batch)
+    job.status = "in_progress" if action == "start" else "cancelled"
     audit(db, user, job, before)
     return job_detail(db, user, job_id)
 
@@ -279,7 +314,7 @@ def job_transition(db: Session, user: User, job_id: int, action: Literal["start"
 def complete(db: Session, user: User, job_id: int, data: Completion, today: date) -> dict:
     require(user, *PRODUCTION)
     job = get_or_fail(db, Job, job_id, lock=True)
-    if job.status != "running":
+    if job.status != "in_progress":
         raise DomainError("Завершить можно только запущенное задание")
     components = set(db.scalars(select(Component.material_code).where(Component.job_id == job_id)))
     if components != set(data.actual):
@@ -289,15 +324,15 @@ def complete(db: Session, user: User, job_id: int, data: Completion, today: date
         batches = list(db.scalars(fifo(code).execution_options(populate_existing=True)))
         for batch in batches:
             allocation = own.get(batch.id)
-            if allocation and allocation.reserved:
-                before = serialize(batch)
-                used = min(allocation.reserved, need)
-                batch.reserved -= allocation.reserved
-                batch.quantity -= used
-                allocation.reserved = ZERO
+            if allocation and allocation.issued:
+                used = min(allocation.issued, need)
+                returned = allocation.issued - used
                 allocation.consumed = used
                 need -= used
-                audit(db, user, batch, before)
+                if returned:
+                    before = serialize(batch)
+                    batch.quantity += returned
+                    audit(db, user, batch, before)
         for batch in batches:
             if not need:
                 break
@@ -322,6 +357,7 @@ def complete(db: Session, user: User, job_id: int, data: Completion, today: date
     db.add(
         Outbox(
             job_id=job_id,
+            idempotency_key=f"candleflow-job-{job_id}",
             payload={
                 "job_id": job_id,
                 "recipe_id": job.recipe_id,
@@ -338,15 +374,18 @@ def job_cost(db: Session, user: User, job_id: int) -> dict:
     require(user, *READERS)
     job = get_or_fail(db, Job, job_id)
     totals: dict[str, Decimal] = defaultdict(Decimal)
-    actual = job.status == "completed"
-    for allocation, batch in allocations(db, job_id):
-        amount = allocation.consumed if actual else allocation.reserved
-        totals[batch.material_code] += amount * batch.unit_cost
+    amount_field = {"completed": "consumed", "in_progress": "issued"}.get(job.status, "reserved")
+    with localcontext() as arithmetic:
+        arithmetic.prec = 64
+        for allocation, batch in allocations(db, job_id):
+            amount = getattr(allocation, amount_field)
+            totals[batch.material_code] += amount * batch.unit_cost
+        total = sum(totals.values(), ZERO)
     return {
         "job_id": job_id,
-        "kind": "actual" if actual else "reserved",
+        "kind": "actual" if amount_field == "consumed" else amount_field,
         "status": job.status,
-        "total_rub": str(sum(totals.values(), ZERO)),
+        "total_rub": str(total),
         "components_rub": {key: str(value) for key, value in totals.items()},
     }
 
@@ -355,10 +394,11 @@ def shortages(db: Session, user: User, period: Period) -> list[dict]:
     require(user, *READERS)
     jobs = db.scalars(
         select(Job.id)
-        .where(Job.status == "shortage", Job.planned_on.between(period.start, period.end))
+        .where(Job.status == "planned", Job.planned_on.between(period.start, period.end))
         .order_by(Job.planned_on, Job.id)
     )
-    return [job_detail(db, user, job_id) for job_id in jobs]
+    details = (job_detail(db, user, job_id) for job_id in jobs)
+    return [job for job in details if any(Decimal(c["missing"]) for c in job["components"])]
 
 
 def consumption(db: Session, user: User, period: Period, material_code: str) -> list[dict]:

@@ -39,7 +39,7 @@ class Batch(Base):
         CheckConstraint("received > 0 AND quantity >= reserved AND reserved >= 0 AND quantity <= received"),
         CheckConstraint("unit_price >= 0 AND exchange_rate > 0 AND unit_cost >= 0"),
         CheckConstraint("currency IN ('RUB', 'EUR', 'USD')"),
-        CheckConstraint("status IN ('inspection', 'accepted', 'rejected')"),
+        CheckConstraint("status IN ('on_review', 'accepted', 'rejected')"),
     )
     id: Mapped[int] = mapped_column(Identity(), primary_key=True)
     material_code: Mapped[str] = mapped_column(ForeignKey("materials.code"), index=True)
@@ -51,6 +51,7 @@ class Batch(Base):
     unit_price: Mapped[Decimal] = mapped_column(AMOUNT)
     currency: Mapped[str]
     exchange_rate: Mapped[Decimal] = mapped_column(AMOUNT)
+    exchange_rate_on: Mapped[date]
     unit_cost: Mapped[Decimal] = mapped_column(AMOUNT)
     status: Mapped[str]
     comment: Mapped[str] = mapped_column(default="")
@@ -74,7 +75,7 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint("quantity > 0 AND quantity = trunc(quantity)"),
-        CheckConstraint("status IN ('planned', 'shortage', 'running', 'completed', 'cancelled')"),
+        CheckConstraint("status IN ('draft', 'planned', 'in_progress', 'completed', 'cancelled')"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     recipe_id: Mapped[int] = mapped_column(ForeignKey("recipes.id"))
@@ -93,10 +94,11 @@ class Component(Base):
 
 class Allocation(Base):
     __tablename__ = "allocations"
-    __table_args__ = (CheckConstraint("reserved >= 0 AND consumed >= 0"),)
+    __table_args__ = (CheckConstraint("reserved >= 0 AND consumed >= 0"), CheckConstraint("issued >= 0"))
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), primary_key=True)
     reserved: Mapped[Decimal] = mapped_column(AMOUNT, default=Decimal(0))
+    issued: Mapped[Decimal] = mapped_column(AMOUNT, default=Decimal(0))
     consumed: Mapped[Decimal] = mapped_column(AMOUNT, default=Decimal(0))
 
 
@@ -115,6 +117,7 @@ class Outbox(Base):
     __tablename__ = "outbox"
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
     payload: Mapped[dict] = mapped_column(JSONB)
+    idempotency_key: Mapped[str] = mapped_column(unique=True)
     next_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     delivered: Mapped[bool] = mapped_column(default=False)
 

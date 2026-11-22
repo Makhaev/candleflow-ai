@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://candleflow:candleflow@localhost:5432/candleflow"
     redis_url: str = "redis://localhost:6379/0"
+    rates_url: str = "http://localhost:8003"
     marking_url: str = "http://localhost:8001"
     ai_provider: str = "fake"
     openai_api_key: str = ""

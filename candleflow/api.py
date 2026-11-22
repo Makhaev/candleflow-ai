@@ -1,21 +1,22 @@
-from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import APIRouter, Cookie, Depends, FastAPI, Query, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from candleflow import inventory as inv
 from candleflow.auth import DomainError, authenticate, login, token_hash
-from candleflow.db import SessionLocal
+from candleflow.db import AsyncSessionLocal
 from candleflow.models import Job, LoginSession, Material, Recipe
+from candleflow.rates import fetch_quote
 from candleflow.schemas import (
     Completion,
     Inspection,
@@ -36,22 +37,22 @@ def today() -> date:
     return datetime.now(ZoneInfo("Europe/Moscow")).date()
 
 
-@contextmanager
-def transaction():
-    with SessionLocal.begin() as db:
+async def get_db():
+    async with AsyncSessionLocal() as db:
         yield db
 
 
-def get_db():
-    with SessionLocal() as db:
-        yield db
+async def get_rate_client():
+    async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+        yield client
 
 
-DB = Annotated[Session, Depends(get_db)]
+DB = Annotated[AsyncSession, Depends(get_db)]
+RateClient = Annotated[httpx.AsyncClient, Depends(get_rate_client)]
 
 
-def current_user(db: DB, token: Annotated[str | None, Cookie(alias=COOKIE)] = None):
-    return authenticate(db, token)
+async def current_user(db: DB, token: Annotated[str | None, Cookie(alias=COOKIE)] = None):
+    return await db.run_sync(authenticate, token)
 
 
 User = Annotated[inv.User, Depends(current_user)]
@@ -83,19 +84,19 @@ def public_user(user: inv.User) -> dict:
 
 
 @router.post("/login")
-def sign_in(data: Login, response: Response, db: DB):
-    user, token = login(db, data.login, data.password)
-    db.commit()
+async def sign_in(data: Login, response: Response, db: DB):
+    user, token = await db.run_sync(login, data.login, data.password)
+    await db.commit()
     response.set_cookie(COOKIE, token, httponly=True, samesite="strict", max_age=43200)
     return public_user(user)
 
 
 @router.post("/logout")
-def sign_out(response: Response, db: DB, token: Annotated[str | None, Cookie(alias=COOKIE)] = None):
-    entry = db.get(LoginSession, token_hash(token)) if token else None
+async def sign_out(response: Response, db: DB, token: Annotated[str | None, Cookie(alias=COOKIE)] = None):
+    entry = await db.get(LoginSession, token_hash(token)) if token else None
     if entry:
-        db.delete(entry)
-        db.commit()
+        await db.delete(entry)
+        await db.commit()
     response.delete_cookie(COOKIE)
     return {"ok": True}
 
@@ -112,28 +113,28 @@ def health():
 
 
 @router.get("/materials")
-def materials(db: DB, user: User):
+async def materials(db: DB, user: User):
     inv.require(user, *inv.READERS)
-    return [inv.serialize(row) for row in db.scalars(select(Material).order_by(Material.code))]
+    return [inv.serialize(row) for row in await db.scalars(select(Material).order_by(Material.code))]
 
 
 @router.post("/materials", status_code=201)
-def create_material(data: MaterialInput, db: DB, user: User):
-    result = inv.add_material(db, user, data)
-    db.commit()
+async def create_material(data: MaterialInput, db: DB, user: User):
+    result = await db.run_sync(inv.add_material, user, data)
+    await db.commit()
     return result
 
 
 @router.get("/recipes")
-def recipes(db: DB, user: User):
+async def recipes(db: DB, user: User):
     inv.require(user, *inv.READERS)
-    return [inv.serialize(row) for row in db.scalars(select(Recipe).order_by(Recipe.id))]
+    return [inv.serialize(row) for row in await db.scalars(select(Recipe).order_by(Recipe.id))]
 
 
 @router.post("/recipes", status_code=201)
-def create_recipe(data: RecipeInput, db: DB, user: User):
-    result = inv.add_recipe(db, user, data)
-    db.commit()
+async def create_recipe(data: RecipeInput, db: DB, user: User):
+    result = await db.run_sync(inv.add_recipe, user, data)
+    await db.commit()
     return result
 
 
@@ -142,7 +143,7 @@ class BatchQuery(BaseModel):
     material_code: str | None = None
     supplier: str | None = None
     received_on: date | None = None
-    status: Literal["inspection", "accepted", "rejected"] | None = None
+    status: Literal["on_review", "accepted", "rejected"] | None = None
     currency: Literal["RUB", "USD", "EUR"] | None = None
     received: Decimal | None = None
     quantity: Decimal | None = None
@@ -150,6 +151,7 @@ class BatchQuery(BaseModel):
     unit_price: Decimal | None = None
     unit_cost: Decimal | None = None
     exchange_rate: Decimal | None = None
+    exchange_rate_on: date | None = None
     comment: str | None = None
     sort: Literal[
         "id",
@@ -164,6 +166,7 @@ class BatchQuery(BaseModel):
         "unit_price",
         "unit_cost",
         "exchange_rate",
+        "exchange_rate_on",
         "comment",
     ] = "id"
     descending: bool = True
@@ -172,10 +175,10 @@ class BatchQuery(BaseModel):
 
 
 @router.get("/batches")
-def batches(query: Annotated[BatchQuery, Query()], db: DB, user: User):
+async def batches(query: Annotated[BatchQuery, Query()], db: DB, user: User):
     filters = query.model_dump(exclude={"sort", "descending", "offset", "limit"})
-    return inv.batch_list(
-        db,
+    return await db.run_sync(
+        inv.batch_list,
         user,
         filters=filters,
         sort=query.sort,
@@ -186,69 +189,88 @@ def batches(query: Annotated[BatchQuery, Query()], db: DB, user: User):
 
 
 @router.post("/receipts", status_code=201)
-def receipt(data: ReceiptInput, db: DB, user: User):
-    result = inv.receive(db, user, data)
-    db.commit()
+async def receipt(data: ReceiptInput, db: DB, user: User, client: RateClient):
+    inv.require(user, "storekeeper", "manager")
+    quotes = {
+        currency: await fetch_quote(client, currency, data.received_on)
+        for currency in sorted({line.currency for line in data.lines})
+    }
+    result = await db.run_sync(inv.receive, user, data, quotes)
+    await db.commit()
     return result
 
 
 @router.get("/batches/{batch_id}")
-def batch(batch_id: int, db: DB, user: User):
-    return inv.batch_history(db, user, batch_id)
+async def batch(batch_id: int, db: DB, user: User):
+    return await db.run_sync(inv.batch_history, user, batch_id)
 
 
 @router.post("/batches/{batch_id}/inspection")
-def inspection(batch_id: int, data: Inspection, db: DB, user: User):
-    result = inv.inspect_batch(db, user, batch_id, data.status)
-    db.commit()
+async def inspection(batch_id: int, data: Inspection, db: DB, user: User):
+    result = await db.run_sync(inv.inspect_batch, user, batch_id, data.status)
+    await db.commit()
     return result
 
 
 @router.get("/stock/{material_code}")
-def stock(material_code: str, db: DB, user: User):
-    return inv.stock(db, user, material_code)
+async def stock(material_code: str, db: DB, user: User):
+    return await db.run_sync(inv.stock, user, material_code)
 
 
 @router.get("/jobs")
-def jobs(db: DB, user: User, offset: Annotated[int, Query(ge=0)] = 0):
+async def jobs(db: DB, user: User, offset: Annotated[int, Query(ge=0)] = 0):
     inv.require(user, *inv.READERS)
-    keys = db.scalars(select(Job.id).order_by(Job.id.desc()).offset(offset).limit(50))
-    return [inv.job_detail(db, user, key) for key in keys]
+    keys = await db.scalars(select(Job.id).order_by(Job.id.desc()).offset(offset).limit(50))
+    return await db.run_sync(lambda sync: [inv.job_detail(sync, user, key) for key in keys])
 
 
 @router.get("/jobs/shortages")
-def shortages(period: Annotated[Period, Query()], db: DB, user: User):
-    return inv.shortages(db, user, period)
+async def shortages(period: Annotated[Period, Query()], db: DB, user: User):
+    return await db.run_sync(inv.shortages, user, period)
 
 
 @router.post("/jobs", status_code=201)
-def create_job(data: JobInput, db: DB, user: User):
-    result = inv.plan(db, user, data)
-    db.commit()
+async def create_job(data: JobInput, db: DB, user: User):
+    result = await db.run_sync(inv.plan, user, data)
+    await db.commit()
+    return result
+
+
+@router.post("/jobs/drafts", status_code=201)
+async def draft(data: JobInput, db: DB, user: User):
+    result = await db.run_sync(inv.create_draft, user, data)
+    await db.commit()
+    return result
+
+
+@router.post("/jobs/{job_id}/plan")
+async def plan_existing(job_id: int, db: DB, user: User):
+    result = await db.run_sync(inv.plan_draft, user, job_id)
+    await db.commit()
     return result
 
 
 @router.get("/jobs/{job_id}")
-def job(job_id: int, db: DB, user: User):
-    return inv.job_detail(db, user, job_id)
+async def job(job_id: int, db: DB, user: User):
+    return await db.run_sync(inv.job_detail, user, job_id)
 
 
 @router.get("/jobs/{job_id}/cost")
-def cost(job_id: int, db: DB, user: User):
-    return inv.job_cost(db, user, job_id)
+async def cost(job_id: int, db: DB, user: User):
+    return await db.run_sync(inv.job_cost, user, job_id)
 
 
 @router.post("/jobs/{job_id}/{action}")
-def transition(job_id: int, action: Literal["start", "cancel"], db: DB, user: User):
-    result = inv.job_transition(db, user, job_id, action)
-    db.commit()
+async def transition(job_id: int, action: Literal["start", "cancel"], db: DB, user: User):
+    result = await db.run_sync(inv.job_transition, user, job_id, action)
+    await db.commit()
     return result
 
 
 @router.post("/completion/{job_id}")
-def completion(job_id: int, data: Completion, db: DB, user: User):
-    result = inv.complete(db, user, job_id, data, today())
-    db.commit()
+async def completion(job_id: int, data: Completion, db: DB, user: User):
+    result = await db.run_sync(inv.complete, user, job_id, data, today())
+    await db.commit()
     return result
 
 

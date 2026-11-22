@@ -17,10 +17,6 @@ celery.conf.update(
 )
 
 
-def idempotency_key(job_id: int) -> str:
-    return f"candleflow-job-{job_id}"
-
-
 def deliver_one(client: httpx.Client, now: datetime) -> bool:
     with SessionLocal.begin() as db:
         item = db.scalar(
@@ -41,7 +37,7 @@ def deliver_one(client: httpx.Client, now: datetime) -> bool:
             response = client.post(
                 settings.marking_url + "/reports",
                 json=item.payload,
-                headers={"Idempotency-Key": idempotency_key(item.job_id)},
+                headers={"Idempotency-Key": item.idempotency_key},
                 timeout=3,
             )
             outcome = str(response.status_code)

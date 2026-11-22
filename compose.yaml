@@ -1,19 +1,15 @@
 x-backend: &backend
   build: .
   image: candleflow-backend:local
-  environment:
+  environment: &backend-env
     DATABASE_URL: postgresql+psycopg://candleflow:candleflow@db:5432/candleflow
     REDIS_URL: redis://redis:6379/0
+    RATES_URL: http://rates:8003
     MARKING_URL: http://marking:8001
-    AI_PROVIDER: ${AI_PROVIDER:-fake}
-    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    PRIMARY_MODEL: ${PRIMARY_MODEL:-gpt-5-mini}
-    FALLBACK_MODEL: ${FALLBACK_MODEL:-gpt-6-luna}
-    LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
 
 services:
   db:
-    image: postgres:17-alpine
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
     environment:
       POSTGRES_USER: candleflow
       POSTGRES_PASSWORD: candleflow
@@ -39,10 +35,21 @@ services:
       db: { condition: service_healthy }
   api:
     <<: *backend
+    environment:
+      <<: *backend-env
+      AI_PROVIDER: ${AI_PROVIDER:-fake}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      PRIMARY_MODEL: ${PRIMARY_MODEL:-gpt-5-mini}
+      FALLBACK_MODEL: ${FALLBACK_MODEL:-gpt-6-luna}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
     depends_on:
+      rates: { condition: service_started }
       init: { condition: service_completed_successfully }
     ports:
       - "127.0.0.1:8000:8000"
+  rates:
+    <<: *backend
+    command: ["uvicorn", "candleflow.rate_mock:app", "--host", "0.0.0.0", "--port", "8003"]
   marking:
     <<: *backend
     command: ["uvicorn", "candleflow.marking_mock:app", "--host", "0.0.0.0", "--port", "8001"]

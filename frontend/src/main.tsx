@@ -38,7 +38,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
     <Brand />
     <h1>Вход в мастерскую</h1>
     <label>Демо-роль<select value={login} onChange={event => setLogin(event.target.value)}>
-      {Object.entries(label).slice(0, 3).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+      {Object.entries(label).slice(0, 3).map(([id, name]) => <option key={id} value={id === 'storekeeper' ? 'warehouse' : id}>{name}</option>)}
     </select></label>
     <label>Пароль<input type="password" autoComplete="current-password" value={password}
       onChange={event => setPassword(event.target.value)} required /></label>

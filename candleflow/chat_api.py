@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 from typing import Annotated
 
+from anyio import CancelScope, create_memory_object_stream, create_task_group, to_thread
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
@@ -18,24 +19,27 @@ router = APIRouter(prefix="/api")
 
 
 @router.get("/conversations")
-def conversations(db: DB, user: User):
+async def conversations(db: DB, user: User):
     query = select(Conversation).where(Conversation.user_id == user.id).order_by(Conversation.id.desc())
-    return [inv.serialize(row) for row in db.scalars(query.limit(100))]
+    return [inv.serialize(row) for row in await db.scalars(query.limit(100))]
 
 
 @router.post("/conversations", status_code=201)
-def new_conversation(db: DB, user: User):
+async def new_conversation(db: DB, user: User):
     row = Conversation(user_id=user.id, title="Новый диалог")
     db.add(row)
-    db.commit()
+    await db.commit()
     return inv.serialize(row)
 
 
 @router.get("/conversations/{key}")
-def get_conversation(key: int, db: DB, user: User):
-    row = ai.conversation(db, user.id, key)
-    messages = db.scalars(select(Message).where(Message.conversation_id == key).order_by(Message.id))
-    return {**inv.serialize(row), "messages": [ai.message_view(db, item) for item in messages]}
+async def get_conversation(key: int, db: DB, user: User):
+    row = await db.run_sync(ai.conversation, user.id, key)
+    messages = await db.scalars(select(Message).where(Message.conversation_id == key).order_by(Message.id))
+    return {
+        **inv.serialize(row),
+        "messages": await db.run_sync(lambda sync: [ai.message_view(sync, item) for item in messages]),
+    }
 
 
 @router.post("/conversations/{key}/stream")
@@ -46,7 +50,7 @@ async def stream(
     question: Annotated[str, Form(min_length=1, max_length=5000)],
     upload: Annotated[UploadFile | None, File()] = None,
 ):
-    ai.conversation(db, user.id, key)
+    await db.run_sync(ai.conversation, user.id, key)
     question = question.strip()
     if not question:
         raise DomainError("Введите вопрос", 422)
@@ -56,15 +60,32 @@ async def stream(
         await upload.close()
         if len(data) > 2_000_000:
             raise DomainError("Размер файла превышает 2 МБ", 413)
-        attachment = sanitize_upload(upload.filename or "", data, Pseudonyms(db))
-    pending = ai.start(db, user, key, question)
+        attachment = await to_thread.run_sync(
+            sanitize_upload, upload.filename or "", data, await db.run_sync(Pseudonyms)
+        )
+    pending = await db.run_sync(ai.start, user, key, question)
     actor = user.id
-    db.commit()
+    await db.commit()
 
     async def events() -> AsyncIterator[bytes]:
-        async with aclosing(ai.generate(actor, key, pending, question, today(), attachment)) as iterator:
-            async for item in iterator:
-                yield ("data: " + json.dumps(item, ensure_ascii=False) + "\n\n").encode("utf-8")
+        send, receive = create_memory_object_stream[dict](4)
+        async with create_task_group() as tasks:
+
+            async def produce():
+                async with send:
+                    with CancelScope() as scope:
+                        tasks.start_soon(ai.watch_stop, pending, scope)
+                        async with aclosing(
+                            ai.generate(actor, key, pending, question, today(), attachment)
+                        ) as iterator:
+                            async for item in iterator:
+                                await send.send(item)
+
+            tasks.start_soon(produce)
+            async with receive:
+                async for item in receive:
+                    yield ("data: " + json.dumps(item, ensure_ascii=False) + "\n\n").encode("utf-8")
+            tasks.cancel_scope.cancel()
 
     return StreamingResponse(
         events(),
@@ -73,34 +94,41 @@ async def stream(
     )
 
 
+@router.post("/messages/{key}/stop", status_code=204)
+async def stop(key: int, db: DB, user: User):
+    await db.run_sync(ai.request_stop, user.id, key)
+    await db.commit()
+    return Response(status_code=204)
+
+
 @router.post("/messages/{key}/confirm")
-def confirm(key: int, db: DB, user: User):
-    result = ai.confirm(db, user, key)
-    db.commit()
+async def confirm(key: int, db: DB, user: User):
+    result = await db.run_sync(ai.confirm, user, key)
+    await db.commit()
     return result
 
 
 @router.get("/memory")
-def memory(db: DB, user: User):
-    return [inv.serialize(row) for row in ai.preferences(db, user.id)]
+async def memory(db: DB, user: User):
+    return [inv.serialize(row) for row in await db.run_sync(ai.preferences, user.id)]
 
 
 @router.delete("/memory/{key}", status_code=204)
-def delete_memory(key: int, db: DB, user: User):
-    row = db.scalar(select(Memory).where(Memory.id == key, Memory.user_id == user.id))
+async def delete_memory(key: int, db: DB, user: User):
+    row = await db.scalar(select(Memory).where(Memory.id == key, Memory.user_id == user.id))
     if row is None:
         raise DomainError("Факт не найден", 404)
-    db.delete(row)
-    db.commit()
+    await db.delete(row)
+    await db.commit()
     return Response(status_code=204)
 
 
 @router.get("/artifacts/{key}")
-def download(key: int, db: DB, user: User):
-    row = db.get(Artifact, key)
+async def download(key: int, db: DB, user: User):
+    row = await db.get(Artifact, key)
     if row is None:
         raise DomainError("Файл не найден", 404)
-    ai.message(db, user.id, row.message_id)
+    await db.run_sync(ai.message, user.id, row.message_id)
     from urllib.parse import quote
 
     return Response(

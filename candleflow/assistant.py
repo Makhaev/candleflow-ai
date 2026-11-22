@@ -5,10 +5,11 @@ import json
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Annotated, Literal
 
+from anyio import CancelScope, move_on_after
 from openai import OpenAIError
 from pydantic import Field, ValidationError
 from sqlalchemy import select, update
@@ -17,14 +18,15 @@ from sqlalchemy.orm import Session
 
 from candleflow import inventory as inv
 from candleflow.auth import DomainError
-from candleflow.chat_models import Artifact, Conversation, Memory, Message, Proposal
+from candleflow.chat_models import Artifact, Conversation, Memory, Message, PendingAction
 from candleflow.config import settings
-from candleflow.db import SessionLocal
+from candleflow.db import AsyncSessionLocal
+from candleflow.grounding import interpreter_numbers, numbers
 from candleflow.llm import FakeProvider, Final, OpenAIProvider, Provider, ProviderError, Restart, run_round
 from candleflow.models import Recipe, User
 from candleflow.privacy import Pseudonyms
-from candleflow.rates import exchange_rate
-from candleflow.schemas import Code, Input, JobInput, Period, Text
+from candleflow.rates import mock_quote
+from candleflow.schemas import Code, Input, JobInput, Period, Pieces, Text
 
 PROMPT = (Path(__file__).resolve().parent.parent / "prompts" / "assistant.md").read_text(encoding="utf-8")
 MIMES = {
@@ -46,6 +48,17 @@ class CostArgs(Input):
     job_id: Annotated[int, Field(gt=0)]
 
 
+class ShortageArgs(Input):
+    date_from: date
+    date_to: date
+
+
+class JobPlanArgs(Input):
+    recipe_id: Annotated[int, Field(gt=0)]
+    quantity: Pieces
+    planned_date: date
+
+
 class ConsumptionArgs(Period):
     material_code: Code
 
@@ -56,14 +69,20 @@ class Preference(Input):
 
 
 TOOLS = {
-    "stock": (StockArgs, "Общий и свободный остаток принятого материала по коду."),
-    "shortages": (Period, "Дефициты производственных заданий за период включительно."),
-    "batch_history": (HistoryArgs, "История партии по её номеру."),
-    "job_cost": (CostArgs, "Зарезервированная или фактическая себестоимость задания в рублях."),
-    "propose_job": (JobInput, "Подготовить предложение запланировать задание."),
+    "get_material_stock": (
+        StockArgs,
+        "Физический остаток по всем партиям, резерв и свободный остаток по принятым партиям.",
+    ),
+    "get_production_shortages": (ShortageArgs, "Дефициты производственных заданий за период включительно."),
+    "get_batch_history": (HistoryArgs, "История партии по её номеру."),
+    "calculate_job_cost": (CostArgs, "Зарезервированная или фактическая себестоимость задания в рублях."),
+    "create_and_plan_job": (JobPlanArgs, "Подготовить предложение запланировать задание."),
     "consumption_dataset": (ConsumptionArgs, "Подготовить CSV расхода материала по датам для расчёта."),
     "job_cost_dataset": (CostArgs, "Подготовить CSV себестоимости по компонентам для сценарного расчёта."),
-    "remember_preference": (Preference, "Запомнить явно указанное пользователем предпочтение."),
+    "remember_preference": (
+        Preference,
+        "Предложить сохранить явно указанное пользователем предпочтение после подтверждения.",
+    ),
 }
 
 
@@ -87,7 +106,7 @@ def message_view(db: Session, row: Message) -> dict:
     files = db.execute(
         select(Artifact.id, Artifact.filename, Artifact.mime).where(Artifact.message_id == row.id)
     )
-    proposal = db.get(Proposal, row.id) if row.status == "complete" else None
+    proposal = db.get(PendingAction, row.id) if row.status == "complete" else None
     return {
         **inv.serialize(row),
         "files": [dict(file._mapping) for file in files],
@@ -117,16 +136,27 @@ def start(db: Session, user: User, key: int, question: str) -> int:
 
 def confirm(db: Session, user: User, message_id: int) -> dict:
     row = message(db, user.id, message_id, lock=True)
-    proposal = db.get(Proposal, row.id, with_for_update=True)
+    proposal = db.get(PendingAction, row.id, with_for_update=True)
     if row.status != "complete" or proposal is None:
         raise DomainError("Предложение недоступно", 404)
-    inv.require(user, *inv.PRODUCTION)
-    if proposal.job_id:
-        return inv.job_detail(db, user, proposal.job_id)
-    if proposal.expires <= datetime.now(UTC):
+    if proposal.action == "plan_job":
+        inv.require(user, *inv.PRODUCTION)
+        if proposal.job_id:
+            return inv.job_detail(db, user, proposal.job_id)
+    else:
+        inv.require(user, *inv.READERS)
+        if proposal.confirmed_at:
+            return {"confirmed": True}
+    now = datetime.now(UTC)
+    if proposal.expires <= now:
         raise DomainError("Срок подтверждения истёк. Подготовьте новое предложение.")
+    if proposal.action == "remember_preference":
+        save_preference(db, user, Preference.model_validate(proposal.args))
+        proposal.confirmed_at = now
+        return {"confirmed": True}
     job = inv.plan(db, user, JobInput.model_validate(proposal.args))
     proposal.job_id = job["id"]
+    proposal.confirmed_at = now
     return job
 
 
@@ -159,24 +189,30 @@ def invoke(
 ) -> tuple[dict, bytes | None]:
     if name not in TOOLS:
         raise DomainError("Инструмент недоступен", 422)
+    inv.require(user, *inv.READERS)
     data = TOOLS[name][0].model_validate_json(arguments)
-    if name == "stock":
+    if name == "get_material_stock":
         return inv.stock(db, user, data.material_code), None
-    if name == "shortages":
-        return {"jobs": inv.shortages(db, user, data)[:50]}, None
-    if name == "batch_history":
+    if name == "get_production_shortages":
+        period = Period(start=data.date_from, end=data.date_to)
+        return {"jobs": inv.shortages(db, user, period)[:50]}, None
+    if name == "get_batch_history":
         result = inv.batch_history(db, user, data.batch_id)
         result["history"] = result["history"][-50:]
         return result, None
-    if name in {"job_cost", "job_cost_dataset"}:
+    if name in {"calculate_job_cost", "job_cost_dataset"}:
         result = inv.job_cost(db, user, data.job_id)
-        if name == "job_cost":
+        if name == "calculate_job_cost":
             currency = next((row.value for row in preferences(db, user.id) if row.key == "currency"), "RUB")
             if currency != "RUB":
-                rate = exchange_rate(currency, today)
+                quote = mock_quote(currency, today)
                 result["currency"] = currency
-                result["converted"] = str((Decimal(result["total_rub"]) / rate).quantize(Decimal("0.01")))
-                result["rate_on"] = str(today)
+                with localcontext() as arithmetic:
+                    arithmetic.prec = 64
+                    result["converted"] = str(
+                        (Decimal(result["total_rub"]) / quote.rate).quantize(Decimal("0.01"))
+                    )
+                result["rate_on"] = str(quote.day)
             return result, None
         rows = list(result["components_rub"].items())
         if not rows:
@@ -188,19 +224,20 @@ def invoke(
             raise DomainError("За указанный период нет данных о расходе этого материала", 422)
         payload = csv_bytes(["date", "quantity"], [(row["date"], row["quantity"]) for row in rows])
         return {"dataset": "consumption.csv", "rows": len(rows)}, payload
-    if name == "propose_job":
-        recipe = inv.recipe_for_plan(db, user, data)
+    if name == "create_and_plan_job":
+        job = JobInput(recipe_id=data.recipe_id, quantity=data.quantity, planned_on=data.planned_date)
+        recipe = inv.recipe_for_plan(db, user, job)
         if not re.match(
             r"^\s*(?:пожалуйста[, ]+)?(?:запланиру(?:й|йте)|созда(?:й|йте)|спланиру(?:й|йте))\b",
             question,
             re.IGNORECASE,
         ):
             raise DomainError("Для планирования сформулируйте прямую просьбу", 422)
-        if db.get(Proposal, message_id):
+        if db.get(PendingAction, message_id):
             raise DomainError("Для ответа уже подготовлено предложение")
-        args = data.model_dump(mode="json")
+        args = job.model_dump(mode="json")
         db.add(
-            Proposal(
+            PendingAction(
                 message_id=message_id,
                 args=args,
                 recipe=recipe.name,
@@ -210,7 +247,21 @@ def invoke(
         return {"proposal": {"recipe": recipe.name, **args}}, None
     if not re.match(r"^\s*(?:запомни|сохрани)\b", question, re.IGNORECASE):
         raise DomainError("Укажите явно, какое предпочтение нужно запомнить", 422)
-    return save_preference(db, user, data), None
+    if data.key == "currency" and data.value not in {"RUB", "EUR", "USD"}:
+        raise DomainError("Валюта должна быть RUB, EUR или USD", 422)
+    if db.get(PendingAction, message_id):
+        raise DomainError("Для ответа уже подготовлено предложение")
+    args = data.model_dump(mode="json")
+    db.add(
+        PendingAction(
+            message_id=message_id,
+            args=args,
+            recipe="",
+            action="remember_preference",
+            expires=datetime.now(UTC) + timedelta(minutes=30),
+        )
+    )
+    return {"pending_preference": args}, None
 
 
 def context(db: Session, user_id: int, key: int, day: date) -> tuple[Pseudonyms, str, list[dict]]:
@@ -231,12 +282,10 @@ def context(db: Session, user_id: int, key: int, day: date) -> tuple[Pseudonyms,
             .limit(20)
         )
     )
-    instructions = (
-        f"{PROMPT}\nDATE={day}\nMEMORY={json.dumps(facts, ensure_ascii=False)}"
-        f"\nMATERIALS={json.dumps(aliases.mask(materials), ensure_ascii=False)}"
-        f"\nRECIPES={json.dumps(aliases.mask(recipes), ensure_ascii=False)}"
-    )
-    items = [{"role": row.role, "content": aliases.mask(row.body)} for row in reversed(rows) if row.body]
+    instructions = f"{PROMPT}\nDATE={day}"
+    data_context = aliases.mask({"memory": facts, "materials": materials, "recipes": recipes})
+    items = [{"role": "user", "content": "CONTEXT=" + json.dumps(data_context, ensure_ascii=False)}]
+    items.extend({"role": row.role, "content": aliases.mask(row.body)} for row in reversed(rows) if row.body)
     return aliases, instructions, items
 
 
@@ -259,19 +308,47 @@ async def save_artifacts(provider: Provider, message_id: int, output: list[dict]
                     content = await provider.download(*key)
                 except (OpenAIError, TimeoutError, ValueError):
                     return False
-                with SessionLocal.begin() as db:
+                async with AsyncSessionLocal.begin() as db:
                     db.add(
                         Artifact(message_id=message_id, filename=filename, mime=MIMES[ext], content=content)
                     )
     return True
 
 
-def snapshot(message_id: int, body: str, status: str, model: str | None, tools: list, code: list) -> dict:
-    with SessionLocal.begin() as db:
-        row = db.get(Message, message_id)
-        row.body, row.status, row.model, row.tools, row.code = body, status, model, tools, code
-        db.flush()
-        return message_view(db, row) if status != "streaming" else {}
+async def snapshot(
+    message_id: int,
+    body: str,
+    status: str,
+    model: str | None,
+    tools: list,
+    code: list,
+    attempts: list,
+    tool_calls: list,
+) -> dict:
+    async with AsyncSessionLocal.begin() as db:
+        row = await db.get(Message, message_id, with_for_update=True)
+        row.body = body
+        row.status = "interrupted" if row.stop_requested else status
+        row.model, row.tools, row.code = model, tools, code
+        row.attempts, row.tool_calls = attempts, tool_calls
+        await db.flush()
+        return await db.run_sync(message_view, row)
+
+
+def request_stop(db: Session, user_id: int, message_id: int) -> None:
+    row = message(db, user_id, message_id, lock=True)
+    if row.role == "assistant" and row.status == "streaming":
+        row.stop_requested = True
+
+
+async def watch_stop(message_id: int, scope: CancelScope) -> None:
+    while True:
+        await asyncio.sleep(0.25)
+        async with AsyncSessionLocal() as db:
+            stopped = await db.scalar(select(Message.stop_requested).where(Message.id == message_id))
+        if stopped:
+            scope.cancel()
+            return
 
 
 async def generate(
@@ -283,18 +360,20 @@ async def generate(
     attachment: bytes | None,
     provider: Provider | None = None,
 ) -> AsyncIterator[dict]:
-    body, pending, status = "", "", "interrupted"
-    active_model = None
-    called, code, files = [], [], []
-    aliases = None
+    body, pending, guarded, status = "", "", "", "interrupted"
+    active_model = selected_model = None
+    called, code, files, attempts, tool_calls = [], [], [], [], []
+    evidence: set[Decimal] = set()
 
     def on_model(model: str):
-        nonlocal active_model
-        active_model = model
+        nonlocal active_model, selected_model
+        active_model = selected_model = model
+        if not attempts or attempts[-1] != model:
+            attempts.append(model)
 
     try:
-        with SessionLocal() as db:
-            aliases, instructions, items = context(db, user_id, key, today)
+        async with AsyncSessionLocal() as db:
+            aliases, instructions, items = await db.run_sync(context, user_id, key, today)
         yield {"type": "start", "id": message_id}
         offline = settings.ai_provider == "fake"
         provider = provider or (FakeProvider() if offline else OpenAIProvider())
@@ -319,29 +398,58 @@ async def generate(
                 async for event in stream:
                     if isinstance(event, Final):
                         output = event.output
+                        if event.model:
+                            active_model = event.model
                     elif isinstance(event, Restart):
-                        body, pending = body[:round_start], ""
-                        yield {"type": "reset", "text": body}
+                        body, pending, guarded = body[:round_start], "", ""
+                        yield {"type": "reset", "text": body, "retry": True}
                     else:
                         pending += event
                         boundary = max(pending.rfind(" "), pending.rfind("\n")) + 1
-                        if boundary:
-                            chunk, pending = aliases.restore(pending[:boundary]), pending[boundary:]
-                            body += chunk
-                            yield {"type": "delta", "text": chunk}
+                        if not boundary:
+                            continue
+                        chunk, pending = pending[:boundary], pending[boundary:]
+                        if guarded or numbers(chunk):
+                            guarded += chunk
+                        else:
+                            shown = aliases.restore(chunk)
+                            body += shown
+                            yield {"type": "delta", "text": shown}
             finally:
                 await stream.aclose()
-            if pending:
-                chunk, pending = aliases.restore(pending), ""
-                body += chunk
-                yield {"type": "delta", "text": chunk}
+            if len(models) > 1 and selected_model == models[-1]:
+                models = (selected_model,)
+            guarded += pending
+            pending = ""
+            evidence.update(interpreter_numbers(output))
+            if guarded:
+                if not numbers(guarded).issubset(evidence):
+                    body = body[:round_start]
+                    yield {"type": "reset", "text": body, "retry": False}
+                    guarded = "Не удалось подтвердить числовые данные по результатам инструментов."
+                for piece in re.findall(r"\S+\s*|\s+", guarded):
+                    shown = aliases.restore(piece)
+                    body += shown
+                    yield {"type": "delta", "text": shown}
+            guarded = ""
             items.extend(output)
             calls = [item for item in output if item["type"] == "function_call"]
             for item in output:
                 if item["type"] == "code_interpreter_call":
                     called.append("code_interpreter")
+                    tool_calls.append(
+                        {
+                            "name": "code_interpreter",
+                            "model": active_model,
+                            "status": item.get("status") or "unknown",
+                        }
+                    )
                     if item.get("code"):
-                        code.append(aliases.restore(item["code"]))
+                        code.append(aliases.mask(item["code"]))
+                    if item.get("status") in {"failed", "incomplete"}:
+                        notice = "\nНе удалось выполнить код расчёта."
+                        body += notice
+                        yield {"type": "delta", "text": notice}
             if not calls:
                 if not await save_artifacts(provider, message_id, output):
                     notice = "\nНе удалось сохранить один из файлов расчёта."
@@ -353,51 +461,56 @@ async def generate(
                 status = "complete"
                 break
             for call in calls:
-                name = call["name"]
+                name = call["name"] if call["name"] in TOOLS else "unknown"
                 called.append(name)
+                record = {"name": name, "model": active_model, "status": "interrupted"}
+                tool_calls.append(record)
                 yield {"type": "tool", "name": name}
                 try:
-                    with SessionLocal.begin() as db:
-                        actor = db.get(User, user_id)
-                        result, dataset = invoke(
-                            db, actor, message_id, question, name, call["arguments"], today
+                    async with AsyncSessionLocal.begin() as db:
+                        actor = await db.get(User, user_id)
+                        result, dataset = await db.run_sync(
+                            invoke, actor, message_id, question, name, call["arguments"], today
                         )
                 except DomainError as exc:
                     result, dataset = {"error": str(exc)}, None
                 except ValidationError:
                     result, dataset = {"error": "Проверьте параметры инструмента"}, None
+                safe_result = aliases.mask(result)
+                record["status"] = "error" if "error" in result else "complete"
                 if dataset:
                     files.append(await provider.upload(result["dataset"], dataset))
+                if "error" not in result:
+                    evidence.update(numbers(safe_result))
                 items.append(
                     {
                         "type": "function_call_output",
                         "call_id": call["call_id"],
-                        "output": json.dumps(aliases.mask(result), ensure_ascii=False),
+                        "output": json.dumps(safe_result, ensure_ascii=False),
                     }
                 )
         else:
             raise ProviderError(False)
-    except (ProviderError, OpenAIError, TimeoutError) as exc:
-        del exc
+    except (ProviderError, OpenAIError, TimeoutError):
         notice = "\nНе удалось получить ответ ассистента. Повторите запрос."
         body += notice
         status = "error"
         yield {"type": "delta", "text": notice}
     finally:
-        if pending and aliases:
+        if pending and not guarded and not numbers(pending):
             body += aliases.restore(pending)
-        final = snapshot(message_id, body.strip(), status, active_model, called, code)
+        with CancelScope(shield=True):
+            final = await snapshot(
+                message_id, body.strip(), status, active_model, called, code, attempts, tool_calls
+            )
         if provider:
-
-            async def clean():
-                for upload in files:
-                    try:
-                        await provider.delete(upload)
-                    except (OpenAIError, TimeoutError):
-                        continue
-                await provider.close()
-
-            # Shield cleanup if the HTTP client disconnects while awaiting OpenAI.
-            cleanup = asyncio.create_task(clean())
-            await asyncio.shield(cleanup)
+            with move_on_after(8, shield=True):
+                try:
+                    for upload in files:
+                        try:
+                            await provider.delete(upload)
+                        except (OpenAIError, TimeoutError):
+                            continue
+                finally:
+                    await provider.close()
     yield {"type": "done", "message": final}

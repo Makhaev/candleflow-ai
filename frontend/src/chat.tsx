@@ -22,12 +22,19 @@ function Answer({ answer, confirm, goToJob, busy }: { answer: Message; confirm: 
       <div className="bubble">{answer.body ? answer.body : answer.status === 'streaming' ? 'Готовлю ответ…' : 'Ответ прерван'}</div>
       {answer.status === 'interrupted' && <span className="message-status">Ответ прерван</span>}
       {answer.status === 'error' && <span className="message-status">Ошибка генерации</span>}
+      {answer.attempts.length > 1 && <span className="message-status">
+        {answer.status === 'streaming' ? 'Новая попытка с запасной моделью…'
+          : 'Попытки · ' + answer.attempts.join(' → ')}
+      </span>}
       {proposal && <section className="proposal">
-        <h3>Планирование задания</h3>
-        <p>{proposal.recipe} · {quantity(proposal.args.quantity)} шт · {day(proposal.args.planned_on)}</p>
+        <h3>{proposal.action === 'plan_job' ? 'Планирование задания' : 'Сохранение предпочтения'}</h3>
+        {proposal.action === 'plan_job'
+          ? <p>{proposal.recipe} · {quantity(proposal.args.quantity)} шт · {day(proposal.args.planned_on)}</p>
+          : <p>{proposal.args.key === 'currency' ? 'Валюта' : 'Цех'} · {proposal.args.value}</p>}
         {proposal.job_id ? <button className="secondary" onClick={() => goToJob(proposal.job_id!)}>
           Открыть задание #{proposal.job_id}
-        </button> : <button disabled={busy || Boolean(expired)} onClick={() => confirm(answer.id)}>
+        </button> : proposal.confirmed_at ? <p>Предпочтение сохранено</p>
+          : <button disabled={busy || Boolean(expired)} onClick={() => confirm(answer.id)}>
           {expired ? 'Срок подтверждения истёк' : busy ? 'Подтверждаем…' : 'Подтвердить'}
         </button>}
       </section>}
@@ -58,6 +65,7 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
   const [busy, setBusy] = useState(false)
   const [confirming, setConfirming] = useState<number | null>(null)
   const controller = useRef<AbortController | null>(null)
+  const activeAnswer = useRef<number | null>(null)
   const transcript = useRef<HTMLDivElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const draftInput = useRef<HTMLTextAreaElement>(null)
@@ -102,7 +110,7 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
     let key = active
     let answerId = -2
     const placeholder: Message = { id: answerId, body: '', role: 'assistant', status: 'streaming', model: null,
-      tools: [], code: [], files: [], proposal: null }
+      tools: [], attempts: [], code: [], files: [], proposal: null }
     try {
       if (!key) {
         const created = await api<Conversation>('/conversations', {})
@@ -116,10 +124,12 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
         if (update.type === 'start') {
           setMessages(previous => previous.map(row => row.id === -2 ? { ...row, id: update.id } : row))
           answerId = update.id
+          activeAnswer.current = update.id
         } else if (update.type === 'delta') {
           setMessages(previous => previous.map(row => row.id === answerId ? { ...row, body: row.body + update.text } : row))
         } else if (update.type === 'reset') {
-          setMessages(previous => previous.map(row => row.id === answerId ? { ...row, body: update.text } : row))
+          setMessages(previous => previous.map(row => row.id === answerId ? { ...row, body: update.text,
+            attempts: update.retry ? ['primary', 'fallback'] : row.attempts } : row))
         } else if (update.type === 'tool') {
           setMessages(previous => previous.map(row => row.id === answerId ? { ...row, tools: [...row.tools, update.name] } : row))
         } else {
@@ -143,6 +153,7 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
           if (memory) await refreshFacts()
         } catch (err) { if (!abort.signal.aborted) report(err) }
       }
+      activeAnswer.current = null
       controller.current = null
       setBusy(false)
     }
@@ -152,9 +163,11 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
     setError('')
     setConfirming(id)
     try {
-      const job = await api<Job>('/messages/' + id + '/confirm', {})
+      const result = await api<Job | { confirmed: true }>('/messages/' + id + '/confirm', {})
       setMessages(previous => previous.map(row => row.id === id && row.proposal
-        ? { ...row, proposal: { ...row.proposal, job_id: job.id } } : row))
+        ? { ...row, proposal: { ...row.proposal, job_id: 'id' in result ? result.id : null,
+            confirmed_at: new Date().toISOString() } } : row))
+      if (memory) await refreshFacts()
     } catch (err) { report(err) } finally { setConfirming(null) }
   }
 
@@ -209,7 +222,11 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
               Прикрепить CSV или XLSX
             </button>
             {file && <button className="file-chip" type="button" onClick={clearFile} title="Удалить вложение">{file.name} ×</button>}
-            {busy && controller.current ? <button type="button" className="secondary send" onClick={() => controller.current?.abort()}>
+            {busy && controller.current ? <button type="button" className="secondary send" onClick={() => {
+              const id = activeAnswer.current
+              if (id) api('/messages/' + id + '/stop', {}).catch(report)
+              else controller.current?.abort()
+            }}>
               Остановить
             </button> : <button className="send" disabled={busy || !draft.trim()}>Отправить</button>}
           </div>

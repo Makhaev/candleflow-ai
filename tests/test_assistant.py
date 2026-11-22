@@ -40,7 +40,7 @@ def test_plan_requires_confirmation_and_role(db):
         question = "Запланируй 3 свечи Лаванда на 2026-12-01"
         key = dialog(manager)
         control = ask(manager, key, question)
-        assert control["tools"] == ["propose_job"]
+        assert control["tools"] == ["create_and_plan_job"]
         assert control["proposal"]["args"]["quantity"] == "3"
         assert db.scalar(select(func.count()).select_from(Job)) == 0
         path = f"/api/messages/{control['id']}/confirm"
@@ -62,7 +62,7 @@ def test_permissions_rechecked_after_proposal(db):
     with TestClient(app) as client:
         sign_in(client, "manager")
         answer = ask(client, dialog(client), "Запланируй 2 свечи Лаванда на 2026-12-01")
-        db.get(User, 1).role = "warehouse"
+        db.get(User, 1).role = "storekeeper"
         db.commit()
         assert client.post(f"/api/messages/{answer['id']}/confirm").status_code == 403
 
@@ -88,12 +88,16 @@ def test_memory_isolation_and_deletion(db):
         sign_in(manager, "manager")
         sign_in(warehouse, "warehouse")
         m_key, w_key = dialog(manager), dialog(warehouse)
-        ask(manager, m_key, "Запомни: считать в евро")
+        pending = ask(manager, m_key, "Запомни: считать в евро")
+        assert not manager.get("/api/memory").json()
+        confirmation = f"/api/messages/{pending['id']}/confirm"
+        assert manager.post(confirmation).json() == {"confirmed": True}
+        assert manager.post(confirmation).json() == {"confirmed": True}
         facts = manager.get("/api/memory").json()
         assert [fact["value"] for fact in facts] == ["EUR"]
         assert not warehouse.get("/api/memory").json()
-        assert '"value": "EUR"' in ai.context(db, 1, m_key, DAY)[1]
-        assert '"value": "EUR"' not in ai.context(db, 2, w_key, DAY)[1]
+        assert '"value": "EUR"' in ai.context(db, 1, m_key, DAY)[2][0]["content"]
+        assert '"value": "EUR"' not in ai.context(db, 2, w_key, DAY)[2][0]["content"]
         assert warehouse.delete(f"/api/memory/{facts[0]['id']}").status_code == 404
         assert manager.delete(f"/api/memory/{facts[0]['id']}").status_code == 204
 

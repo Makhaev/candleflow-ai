@@ -19,9 +19,10 @@ const columns: { id: keyof Batch; title: string; type?: string }[] = [
   { id: 'received', title: 'Поступило', type: 'number' },
   { id: 'unit_price', title: 'Цена за ед.', type: 'number' },
   { id: 'exchange_rate', title: 'Курс', type: 'number' },
+  { id: 'exchange_rate_on', title: 'Дата курса', type: 'date' },
   { id: 'comment', title: 'Комментарий' },
 ]
-const statusOptions = ['inspection', 'accepted', 'rejected']
+const statusOptions = ['on_review', 'accepted', 'rejected']
 const currencies = ['RUB', 'USD', 'EUR']
 
 function useHash(pattern: RegExp) {
@@ -135,7 +136,7 @@ function BatchCard({ id, canEdit, updated, close }: { id: number; canEdit: boole
     {record && <>
       <dl className="facts">{columns.filter(column => column.id !== 'id').map(column =>
         <div key={column.id}><dt>{column.title}</dt><dd>{batchValue(record.batch, column.id)}</dd></div>)}</dl>
-      {canEdit && record.batch.status === 'inspection' && <div className="actions">
+      {canEdit && record.batch.status === 'on_review' && <div className="actions">
         <button disabled={busy} onClick={() => inspect('accepted')}>Принять</button>
         <button className="secondary" disabled={busy} onClick={() => inspect('rejected')}>Отметить брак</button>
       </div>}
@@ -161,7 +162,7 @@ function AuditRow({ row }: { row: Audit }) {
 
 function batchValue(batch: Batch, key: keyof Batch, materials: Material[] = []) {
   if (key === 'status') return <Status value={batch.status} />
-  if (key === 'received_on') return day(batch.received_on)
+  if (key === 'received_on' || key === 'exchange_rate_on') return day(batch[key])
   if (key === 'material_code') return materials.find(material => material.code === batch.material_code)?.name ?? batch.material_code
   if (columns.find(column => column.id === key)?.type === 'number') {
     return quantity(String(batch[key])) + (['quantity', 'received', 'reserved'].includes(key)
@@ -182,7 +183,7 @@ export function Warehouse({ user, materials, reloadCatalog }: Catalog) {
   const [form, setForm] = useState<'receipt' | 'material' | null>(null)
   const [revision, setRevision] = useState(0)
   const [selected, select] = useHash(/^#batch-(\d+)$/)
-  const canEdit = user.role === 'warehouse' || user.role === 'manager'
+  const canEdit = user.role === 'storekeeper' || user.role === 'manager'
   useEffect(() => {
     const timer = setTimeout(() => { setApplied(filters); setPage(0) }, 250)
     return () => clearTimeout(timer)
@@ -282,7 +283,9 @@ function PlanForm({ recipes, today, done }: { recipes: Recipe[]; today: string; 
   async function submit(event: FormEvent<HTMLFormElement>) {
     const data = Object.fromEntries(formData(event))
     setBusy(true)
-    try { done((await api<Job>('/jobs', { ...data, recipe_id: Number(data.recipe_id) })).id) }
+    const intent = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null
+    const path = intent?.value === 'plan' ? '/jobs' : '/jobs/drafts'
+    try { done((await api<Job>(path, { ...data, recipe_id: Number(data.recipe_id) })).id) }
     catch (err) { setError(errorText(err)) } finally { setBusy(false) }
   }
   return <form className="edit-form" onSubmit={submit}>
@@ -291,8 +294,15 @@ function PlanForm({ recipes, today, done }: { recipes: Recipe[]; today: string; 
       {recipes.map(recipe => <option value={recipe.id} key={recipe.id}>{recipe.name}</option>)}
     </select></label><label>Количество свечей<input name="quantity" type="number" min="1" step="1" required /></label>
       <label>Дата<input name="planned_on" type="date" defaultValue={today} required /></label></div>
-    <ErrorNote error={error} /><button disabled={busy}>Запланировать и зарезервировать</button>
+    <ErrorNote error={error} /><div className="actions">
+      <button disabled={busy} value="draft">Сохранить черновик</button>
+      <button className="secondary" disabled={busy} value="plan">Запланировать сразу</button>
+    </div>
   </form>
+}
+
+function jobStatus(job: Job) {
+  return job.status === 'planned' && job.components.some(row => row.signal !== 'green') ? 'shortage' : job.status
 }
 
 function JobCard({ id, canEdit, close, updated }: { id: number; canEdit: boolean; close: () => void; updated: () => void }) {
@@ -319,24 +329,25 @@ function JobCard({ id, canEdit, close, updated }: { id: number; canEdit: boolean
   }
   return <Drawer title={job ? 'Задание #' + id + ' · ' + job.recipe : 'Задание #' + id} close={close}>
     {job && <>
-      <div className="job-meta"><Status value={job.status} /><span>{day(job.planned_on)}</span>
+      <div className="job-meta"><Status value={jobStatus(job)} /><span>{day(job.planned_on)}</span>
         <span>{quantity(job.quantity)} свечей</span>
-        {cost && <strong>{cost.kind === 'actual' ? 'Фактическая себестоимость' : 'Стоимость резерва'} · {quantity(cost.total_rub)} ₽</strong>}
+        {cost && <strong>{({ actual: 'Фактическая себестоимость', issued: 'Стоимость выданного сырья', reserved: 'Стоимость резерва' })[cost.kind] ?? 'Себестоимость'} · {quantity(cost.total_rub)} ₽</strong>}
       </div>
       <div className="table-wrap"><table>
-        <thead><tr><th>Компонент</th><th>Потребность</th><th>Резерв</th><th>{job.status === 'completed' ? 'Фактический расход' : 'Дефицит'}</th></tr></thead>
+        <thead><tr><th>Компонент</th><th>Потребность</th><th>Резерв</th>{job.status === 'in_progress' && <th>Списано при запуске</th>}<th>{job.status === 'completed' ? 'Фактический расход' : 'Дефицит'}</th></tr></thead>
         <tbody>{job.components.map(component => <tr key={component.code}>
-          <td>{['planned', 'shortage', 'running'].includes(job.status) && <span className={'signal ' + component.signal}
+          <td>{['planned', 'draft'].includes(job.status) && <span className={'signal ' + component.signal}
             role="img" aria-label={{ green: 'Полный резерв', yellow: 'Частичный резерв', red: 'Без резерва' }[component.signal]} />}
             {component.name}</td>
-          {[component.required, component.reserved, job.status === 'completed' ? component.consumed : component.missing]
+          {[component.required, component.reserved, ...(job.status === 'in_progress' ? [component.issued] : []), job.status === 'completed' ? component.consumed : component.missing]
             .map((amount, index) => <td key={index}>{quantity(amount)} {component.unit}</td>)}
         </tr>)}</tbody></table></div>
-      {canEdit && ['planned', 'shortage'].includes(job.status) && <div className="actions">
-        {job.status === 'planned' && <button disabled={busy} onClick={() => change('start')}>Запустить</button>}
+      {canEdit && ['draft', 'planned'].includes(job.status) && <div className="actions">
+        {job.status === 'draft' && <button disabled={busy} onClick={() => change('plan')}>Запланировать</button>}
+        {jobStatus(job) === 'planned' && <button disabled={busy} onClick={() => change('start')}>Запустить</button>}
         <button className="secondary" disabled={busy} onClick={() => change('cancel')}>Отменить задание</button>
       </div>}
-      {canEdit && job.status === 'running' && <form className="edit-form" onSubmit={event => {
+      {canEdit && job.status === 'in_progress' && <form className="edit-form" onSubmit={event => {
         void change('complete', { actual: Object.fromEntries(formData(event)) })
       }}><fieldset><legend>Фактический расход</legend><div className="form-row">
         {job.components.map(component => <label key={component.code}>{component.name} · {component.unit}
@@ -355,7 +366,7 @@ export function Production({ user, materials, recipes, initialJob, reloadCatalog
   const [form, setForm] = useState<'job' | 'recipe' | null>(null)
   const [selected, setSelected] = useState<number | null>(initialJob)
   const [offset, setOffset] = useState(0)
-  const canEdit = user.role !== 'warehouse'
+  const canEdit = user.role !== 'storekeeper'
   const updated = () => setRevision(previous => previous + 1)
   useEffect(() => {
     let active = true
@@ -378,7 +389,7 @@ export function Production({ user, materials, recipes, initialJob, reloadCatalog
       <thead><tr><th>Задание</th><th>Рецепт</th><th>Количество</th><th>Дата плана</th><th>Статус</th></tr></thead>
       <tbody>{jobs.map(job => <tr key={job.id}>
         <td><button className="link" onClick={() => setSelected(job.id)}>#{job.id}</button></td>
-        <td>{job.recipe}</td><td>{quantity(job.quantity)} шт</td><td>{day(job.planned_on)}</td><td><Status value={job.status} /></td>
+        <td>{job.recipe}</td><td>{quantity(job.quantity)} шт</td><td>{day(job.planned_on)}</td><td><Status value={jobStatus(job)} /></td>
       </tr>)}</tbody>
     </table></div>{!jobs.length && <p className="empty">Задания не найдены</p>}
     {(offset > 0 || jobs.length >= 50) && <div className="pagination">

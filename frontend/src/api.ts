@@ -1,30 +1,31 @@
-export type User = { id: number; name: string; role: 'warehouse' | 'technologist' | 'manager'; today: string }
+export type User = { id: number; name: string; role: 'storekeeper' | 'technologist' | 'manager'; today: string }
 export type Material = { code: string; name: string; unit: string }
 export type Recipe = { id: number; name: string }
 export type Batch = {
   id: number; material_code: string; supplier: string; received_on: string;
   status: string; received: string; quantity: string; reserved: string;
-  unit_price: string; currency: string; unit_cost: string; exchange_rate: string; comment: string;
+  unit_price: string; currency: string; unit_cost: string; exchange_rate: string; exchange_rate_on: string; comment: string;
 }
 export type Audit = { id: number; actor: string; at: string; before: Record<string, unknown> | null; after: Record<string, unknown> }
 export type Component = {
   code: string; name: string; unit: string; required: string; reserved: string;
-  consumed: string; missing: string; signal: 'green' | 'yellow' | 'red';
+  issued: string; consumed: string; missing: string; signal: 'green' | 'yellow' | 'red';
 }
 export type Job = { id: number; recipe: string; quantity: string; planned_on: string; status: string; components: Component[] }
-export type Proposal = {
-  recipe: string; args: { recipe_id: number; quantity: string; planned_on: string }; job_id: number | null; expires: string
-}
+export type Proposal = { job_id: number | null; expires: string; confirmed_at: string | null } & (
+  { action: 'plan_job'; recipe: string; args: { recipe_id: number; quantity: string; planned_on: string } } |
+  { action: 'remember_preference'; args: { key: 'currency' | 'workshop'; value: string } }
+)
 export type Message = {
   id: number; role: 'user' | 'assistant'; body: string; status: string; model: string | null;
-  tools: string[]; code: string[]; files: { id: number; filename: string; mime: string }[]; proposal: Proposal | null
+  tools: string[]; attempts: string[]; code: string[]; files: { id: number; filename: string; mime: string }[]; proposal: Proposal | null
 }
 export type Conversation = { id: number; title: string }
 export type Fact = { id: number; key: string; value: string }
 export type StreamEvent =
   | { type: 'start'; id: number }
   | { type: 'delta'; text: string }
-  | { type: 'reset'; text: string }
+  | { type: 'reset'; text: string; retry: boolean }
   | { type: 'tool'; name: string }
   | { type: 'done'; message: Message }
 
@@ -71,13 +72,15 @@ export async function stream(
 }
 
 export const label: Record<string, string> = {
-  warehouse: 'Кладовщик', technologist: 'Технолог', manager: 'Руководитель',
-  inspection: 'На проверке', accepted: 'Принята', rejected: 'Брак',
-  planned: 'Запланировано', shortage: 'Дефицит', running: 'В работе',
+  storekeeper: 'Кладовщик', technologist: 'Технолог', manager: 'Руководитель',
+  on_review: 'На проверке', accepted: 'Принята', rejected: 'Брак',
+  draft: 'Черновик', planned: 'Запланировано', shortage: 'Дефицит', in_progress: 'В работе',
   completed: 'Завершено', cancelled: 'Отменено',
   stock: 'Остатки', shortages: 'Дефицит', batch_history: 'История партии',
   job_cost: 'Себестоимость', propose_job: 'Планирование', consumption_dataset: 'Расход по датам',
   job_cost_dataset: 'Данные себестоимости', remember_preference: 'Запись в память',
+  get_material_stock: 'Остатки', get_production_shortages: 'Дефицит', get_batch_history: 'История партии',
+  calculate_job_cost: 'Себестоимость', create_and_plan_job: 'Планирование',
   code_interpreter: 'Code Interpreter',
 }
 

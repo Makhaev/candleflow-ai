@@ -76,7 +76,8 @@ def test_parallel_reserves(db):
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: reserve(), range(2)))
-    assert sorted(result["status"] for result in results) == ["planned", "shortage"]
+    assert all(result["status"] == "planned" for result in results)
+    assert sorted(Decimal(r["components"][0]["missing"]) for r in results) == [0, 4]
     assert sum(Decimal(result["components"][0]["reserved"]) for result in results) == 6
     assert db.get(Batch, 1).reserved == 6
 

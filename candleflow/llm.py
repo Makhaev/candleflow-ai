@@ -14,6 +14,7 @@ from candleflow.config import settings
 @dataclass(frozen=True)
 class Final:
     output: list[dict]
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,7 @@ class OpenAIProvider:
                 response = await events.get_final_response()
                 if response.status != "completed":
                     raise ProviderError(False)
-                yield Final([item.model_dump(exclude_none=True) for item in response.output])
+                yield Final([item.model_dump(exclude_none=True) for item in response.output], response.model)
         except (RateLimitError, APIConnectionError) as exc:
             raise ProviderError(True) from exc
         except APIStatusError as exc:
@@ -133,14 +134,14 @@ class FakeProvider:
                 answer = result["error"]
             elif "proposal" in result:
                 answer = "Подготовлено предложение. Проверьте параметры и подтвердите планирование."
-            elif "preference" in result:
-                answer = "Предпочтение сохранено."
+            elif "pending_preference" in result:
+                answer = "Подготовлено предпочтение. Нажмите «Подтвердить», чтобы сохранить его."
             elif "dataset" in result and files:
                 answer, output = self.interpreter()
             elif "total" in result:
                 answer = (
-                    f"{result['name']}: общий остаток {result['total']} {result['unit']}, "
-                    f"свободно {result['free']} {result['unit']}."
+                    f"{result['name']}: общий остаток {result['physical']} {result['unit']}, "
+                    f"свободно {result['free']} {result['unit']}, в резерве {result['reserved']} {result['unit']}."
                 )
             elif "total_rub" in result:
                 answer = f"Себестоимость задания: {result['total_rub']} RUB."
@@ -159,7 +160,9 @@ class FakeProvider:
                 )
             else:
                 answer = "За указанный период дефицит отсутствует."
-        elif match := self.route(normalized, instructions):
+        elif match := self.route(
+            normalized, instructions, json.loads(items[0]["content"].removeprefix("CONTEXT="))
+        ):
             name, args = match
             yield Final(
                 [
@@ -210,7 +213,7 @@ class FakeProvider:
         )
 
     @staticmethod
-    def route(text, instructions):
+    def route(text, instructions, context):
         if "забудь" in text or "отмени" in text:
             return None
         day = date.fromisoformat(re.search(r"DATE=(\d{4}-\d{2}-\d{2})", instructions)[1])
@@ -233,7 +236,7 @@ class FakeProvider:
         }
         code = next((code for word, code in codes.items() if word in text or code.lower() in text), None)
         if text.startswith("запланируй") and nums:
-            recipes = json.loads(instructions.rsplit("\nRECIPES=", 1)[1])
+            recipes = context["recipes"]
             recipe = next((row for row in recipes if row["name"].casefold() in text), None)
             if recipe:
                 target = (
@@ -241,7 +244,11 @@ class FakeProvider:
                     if dates
                     else str(day + timedelta(days=(4 - day.weekday()) % 7) if "пятниц" in text else day)
                 )
-                return "propose_job", {"recipe_id": recipe["id"], "quantity": nums[0], "planned_on": target}
+                return "create_and_plan_job", {
+                    "recipe_id": recipe["id"],
+                    "quantity": nums[0],
+                    "planned_date": target,
+                }
         if text.startswith("запомни"):
             currency = next(
                 (
@@ -258,13 +265,15 @@ class FakeProvider:
                 period = {"start": str(day - timedelta(days=90)), "end": str(day)}
             return "consumption_dataset", {"material_code": code or "SOY", **period}
         if "себестоимость" in text and nums:
-            return ("job_cost_dataset" if "подорож" in text else "job_cost"), {"job_id": int(nums[0])}
+            return ("job_cost_dataset" if "подорож" in text else "calculate_job_cost"), {
+                "job_id": int(nums[0])
+            }
         if ("партии" in text or "партия" in text) and nums:
-            return "batch_history", {"batch_id": int(nums[0])}
+            return "get_batch_history", {"batch_id": int(nums[0])}
         if "дефицит" in text or "не хват" in text:
-            return "shortages", period
+            return "get_production_shortages", {"date_from": period["start"], "date_to": period["end"]}
         if ("остат" in text or "сколько" in text) and code:
-            return "stock", {"material_code": code}
+            return "get_material_stock", {"material_code": code}
         return None
 
 
