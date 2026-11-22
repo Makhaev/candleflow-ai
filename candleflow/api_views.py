@@ -109,6 +109,11 @@ class AuditView(BaseModel):
     after: dict[str, Any]
 
 
+class AuditPage(BaseModel):
+    total: int
+    items: list[AuditView]
+
+
 class MovementView(BaseModel):
     id: int
     batch_id: int

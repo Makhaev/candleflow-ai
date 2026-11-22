@@ -6,7 +6,7 @@ export type Batch = {
   status: string; received: string; quantity: string; reserved: string;
   unit_price: string; currency: string; unit_cost: string; exchange_rate: string; exchange_rate_on: string; comment: string;
 }
-export type Audit = { id: number; actor: string; at: string; before: Record<string, unknown> | null; after: Record<string, unknown> }
+export type Audit = { id: number; actor: string; at: string; entity: string; entity_id: string; before: Record<string, unknown> | null; after: Record<string, unknown> }
 export type Component = {
   code: string; name: string; unit: string; required: string; reserved: string;
   issued: string; consumed: string; missing: string; signal: 'green' | 'yellow' | 'red';
@@ -16,9 +16,10 @@ export type Proposal = { job_id: number | null; expires: string; confirmed_at: s
   { action: 'plan_job'; recipe: string; args: { recipe_id: number; quantity: string; planned_on: string } } |
   { action: 'remember_preference'; args: { key: 'currency' | 'workshop'; value: string } }
 )
+export type ToolCall = { ordinal: number; name: string; model: string | null; status: string; at: string }
 export type Message = {
   id: number; role: 'user' | 'assistant'; body: string; status: string; model: string | null;
-  tools: string[]; attempts: string[]; code: string[]; files: { id: number; filename: string; mime: string }[]; proposal: Proposal | null
+  tools: string[]; tool_calls: ToolCall[]; attempts: string[]; code: string[]; files: { id: number; filename: string; mime: string }[]; proposal: Proposal | null
 }
 export type Conversation = { id: number; title: string }
 export type Fact = { id: number; key: string; value: string }
@@ -29,14 +30,21 @@ export type StreamEvent =
   | { type: 'tool'; name: string }
   | { type: 'done'; message: Message }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+  }
+}
+
 export async function responseError(response: Response) {
   const error = await response.json().catch(() => ({ detail: 'Сервис временно недоступен' }))
-  return new Error(error.detail || 'Не удалось выполнить запрос')
+  return new ApiError(typeof error.detail === 'string' ? error.detail : 'Не удалось выполнить запрос', response.status)
 }
 
 export async function api<T>(path: string, body?: unknown, method = body === undefined ? 'GET' : 'POST'): Promise<T> {
   const response = await fetch('/api' + path, {
     method,
+    cache: 'no-store',
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   })
@@ -82,6 +90,14 @@ export const label: Record<string, string> = {
   get_material_stock: 'Остатки', get_production_shortages: 'Дефицит', get_batch_history: 'История партии',
   calculate_job_cost: 'Себестоимость', create_and_plan_job: 'Планирование',
   code_interpreter: 'Code Interpreter',
+}
+
+const workshopTime = new Intl.DateTimeFormat('ru-RU', {
+  timeZone: 'Europe/Moscow', dateStyle: 'short', timeStyle: 'short',
+})
+
+export function dateTime(value: string) {
+  return workshopTime.format(new Date(value))
 }
 
 export function day(value: string) {

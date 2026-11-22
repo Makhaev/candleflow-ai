@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { label } from './api'
 
@@ -10,7 +11,12 @@ export function Status({ value }: { value: string }) {
 }
 
 export function Drawer({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
-  return <section className="drawer" aria-label={title}>
+  const section = useRef<HTMLElement>(null)
+  useEffect(() => {
+    section.current?.focus({ preventScroll: true })
+    section.current?.scrollIntoView({ block: 'nearest' })
+  }, [])
+  return <section className="drawer" ref={section} tabIndex={-1} aria-label={title}>
     <div className="section-head"><h2>{title}</h2><button className="secondary" onClick={close}>Закрыть</button></div>
     {children}
   </section>

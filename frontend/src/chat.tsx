@@ -4,6 +4,11 @@ import { api, day, label, quantity, stream } from './api'
 import type { Conversation, Fact, Job, Message, StreamEvent } from './api'
 import { ErrorNote, errorText } from './common'
 
+const executionStatus: Record<string, string> = {
+  complete: 'Выполнен', completed: 'Выполнен', interrupted: 'Прерван',
+  failed: 'Ошибка', incomplete: 'Прерван', error: 'Ошибка', unknown: 'Статус недоступен',
+}
+
 const examples = [
   'Какой общий и свободный остаток соевого воска?',
   'Чего не хватает на задания этой недели?',
@@ -39,13 +44,22 @@ function Answer({ answer, confirm, goToJob, busy }: { answer: Message; confirm: 
         </button>}
       </section>}
       {answer.files.map(file => <div className="artifact" key={file.id}>
-        {file.mime === 'image/png' && <img src={'/api/artifacts/' + file.id} alt={file.filename} />}
-        <a href={'/api/artifacts/' + file.id} download>{file.filename}</a>
+        {file.mime === 'image/png' && <img src={'/api/files/' + file.id} alt={file.filename} />}
+        <a href={'/api/files/' + file.id} download>{file.filename}</a>
       </div>)}
       {(answer.model || answer.tools.length > 0) && <div className="answer-meta">
-        {answer.model && <span>{answer.model === 'demo' ? 'Демо-модель' : answer.model}</span>}
-        {answer.tools.map((name, index) => <span key={name + index}>{label[name] ?? name}</span>)}
+        {answer.model && <span title={answer.model}>{answer.model === 'demo' ? 'Демо-модель' : answer.model}</span>}
+        {answer.status === 'streaming' && answer.tools.map((name, index) =>
+          <span key={name + index}>{label[name] ?? name}</span>)}
       </div>}
+      {answer.tool_calls.length > 0 && <details className="tool-log">
+        <summary>Вызовы инструментов · {answer.tool_calls.length}</summary>
+        <ol>{answer.tool_calls.map(call => <li key={call.ordinal}>
+          <strong>{label[call.name] ?? call.name}</strong>
+          <span>{executionStatus[call.status] ?? call.status}</span>
+          {call.model && <span>{call.model}</span>}
+        </li>)}</ol>
+      </details>}
       {answer.code.length > 0 && <details className="code">
         <summary>Выполненный код</summary>{answer.code.map((code, index) => <pre key={index}>{code}</pre>)}
       </details>}
@@ -60,6 +74,9 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
   const [draft, setDraft] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [facts, setFacts] = useState<Fact[]>([])
+  const [loadingFacts, setLoadingFacts] = useState(false)
+  const [deletingFact, setDeletingFact] = useState<number | null>(null)
+  const [stopping, setStopping] = useState(false)
   const [memory, showMemory] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -72,6 +89,31 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
   const report = (err: unknown) => setError(errorText(err))
   const refreshList = () => api<Conversation[]>('/conversations').then(setConversations)
   const refreshFacts = () => api<Fact[]>('/memory').then(setFacts)
+  async function toggleMemory() {
+    showMemory(!memory)
+    if (memory) return
+    setError('')
+    setLoadingFacts(true)
+    try { await refreshFacts() } catch (err) { report(err) } finally { setLoadingFacts(false) }
+  }
+
+  async function deleteFact(id: number) {
+    setDeletingFact(id)
+    setError('')
+    try {
+      await api('/memory/' + id, undefined, 'DELETE')
+      await refreshFacts()
+    } catch (err) { report(err) } finally { setDeletingFact(null) }
+  }
+
+  async function stop() {
+    setStopping(true)
+    try {
+      const id = activeAnswer.current
+      if (id) await api('/messages/' + id + '/stop', {})
+      else controller.current?.abort()
+    } catch (err) { report(err); setStopping(false) }
+  }
   const load = (key: number) => api<{ messages: Message[] }>('/conversations/' + key)
   useEffect(() => {
     let mounted = true
@@ -110,7 +152,7 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
     let key = active
     let answerId = -2
     const placeholder: Message = { id: answerId, body: '', role: 'assistant', status: 'streaming', model: null,
-      tools: [], attempts: [], code: [], files: [], proposal: null }
+      tools: [], tool_calls: [], attempts: [], code: [], files: [], proposal: null }
     try {
       if (!key) {
         const created = await api<Conversation>('/conversations', {})
@@ -155,6 +197,7 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
       }
       activeAnswer.current = null
       controller.current = null
+      setStopping(false)
       setBusy(false)
     }
   }
@@ -174,16 +217,17 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
   return <>
     <header className="page-head"><div><h1>Ассистент мастерской</h1>
       <p>Остатки, дефициты, себестоимость и планирование</p></div>
-      <button className="secondary" onClick={() => { showMemory(!memory); if (!memory) refreshFacts().catch(report) }}>
+      <button className="secondary" onClick={toggleMemory} aria-expanded={memory}>
         {memory ? 'Скрыть память' : 'Память'}
       </button>
     </header>
     {memory && <section className="drawer"><h2>Мои предпочтения</h2>
       <p className="muted">Скажите ассистенту, что запомнить, например «Запомни, считать в евро».</p>
-      {facts.length ? <ul className="memory-list">{facts.map(fact => <li key={fact.id}>
+      {loadingFacts ? <p className="muted" role="status">Загружаем предпочтения…</p>
+        : facts.length ? <ul className="memory-list">{facts.map(fact => <li key={fact.id}>
         <span>{fact.key === 'currency' ? 'Валюта' : 'Цех'} · {fact.value}</span>
-        <button className="secondary compact" onClick={() => api('/memory/' + fact.id, undefined, 'DELETE')
-          .then(refreshFacts).catch(report)}>Удалить</button>
+        <button className="secondary compact" disabled={deletingFact !== null}
+          onClick={() => deleteFact(fact.id)}>{deletingFact === fact.id ? 'Удаляем…' : 'Удалить'}</button>
       </li>)}</ul> : <p>Нет сохранённых предпочтений.</p>}
     </section>}
     <ErrorNote error={error} />
@@ -192,9 +236,10 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
         <button className="secondary" disabled={busy} onClick={() => {
           setActive(null); setMessages([]); setDraft(''); clearFile(); setError(''); draftInput.current?.focus()
         }}>Новый диалог</button>
-        <div className="chat-history-list">
+        <div className="chat-history-list" aria-label="История диалогов">
           {conversations.map(item => <button key={item.id} className={active === item.id ? 'selected' : ''}
-            disabled={busy} onClick={() => open(item.id)} title={item.title}>{item.title}</button>)}
+            disabled={busy} aria-current={active === item.id ? 'true' : undefined}
+            onClick={() => open(item.id)} title={item.title}>{item.title}</button>)}
         </div>
       </aside>
       <div className="chat-content">
@@ -222,12 +267,8 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
               Прикрепить CSV или XLSX
             </button>
             {file && <button className="file-chip" type="button" onClick={clearFile} title="Удалить вложение">{file.name} ×</button>}
-            {busy && controller.current ? <button type="button" className="secondary send" onClick={() => {
-              const id = activeAnswer.current
-              if (id) api('/messages/' + id + '/stop', {}).catch(report)
-              else controller.current?.abort()
-            }}>
-              Остановить
+            {busy && controller.current ? <button type="button" className="secondary send" disabled={stopping} onClick={stop}>
+              {stopping ? 'Останавливаем…' : 'Остановить'}
             </button> : <button className="send" disabled={busy || !draft.trim()}>Отправить</button>}
           </div>
         </form>

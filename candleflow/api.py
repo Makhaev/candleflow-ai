@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
@@ -8,7 +8,7 @@ from fastapi import APIRouter, Cookie, Depends, FastAPI, Query, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyCookie
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,13 +34,14 @@ from candleflow.schemas import (
 app = FastAPI(title="CandleFlow")
 router = APIRouter(prefix="/api", tags=["Учёт"], responses=view.errors(422, 503))
 COOKIE = "candleflow_session"
+WORKSHOP_TIME = ZoneInfo("Europe/Moscow")
 session_cookie = APIKeyCookie(name=COOKIE, scheme_name="CandleFlowSession", auto_error=False)
 PageOffset = Annotated[int, Query(ge=0)]
 PageLimit = Annotated[int, Query(ge=1, le=100)]
 
 
 def today() -> date:
-    return datetime.now(ZoneInfo("Europe/Moscow")).date()
+    return datetime.now(WORKSHOP_TIME).date()
 
 
 async def get_db():
@@ -90,13 +91,22 @@ def public_user(user: inv.User) -> dict:
 
 
 @router.post(
-    "/login", response_model=view.UserView, tags=["Сессия"], responses=view.errors(401), summary="Войти"
+    "/login", response_model=view.SessionView, tags=["Сессия"], responses=view.errors(401), summary="Войти"
 )
-async def sign_in(data: Login, response: Response, db: DB):
+async def sign_in(
+    data: Login,
+    response: Response,
+    db: DB,
+    current_token: Annotated[str | None, Cookie(alias=COOKIE)] = None,
+):
     user, token = await db.run_sync(login, data.login, data.password)
+    if current_token:
+        previous = await db.get(LoginSession, token_hash(current_token))
+        if previous:
+            await db.delete(previous)
     await db.commit()
     response.set_cookie(COOKIE, token, httponly=True, samesite="strict", max_age=43200)
-    return public_user(user)
+    return me(user)
 
 
 @router.post("/logout", response_model=view.OkView, tags=["Сессия"], summary="Выйти")
@@ -456,6 +466,44 @@ async def batch_history(batch_id: int, db: DB, user: User, offset: PageOffset = 
 )
 async def job_history(job_id: int, db: DB, user: User, offset: PageOffset = 0, limit: PageLimit = 20):
     return await db.run_sync(inv.history, user, "production_jobs", job_id, offset, limit)
+
+
+class AuditQuery(BaseModel):
+    entity: Literal["materials", "recipes", "receipts", "batches", "production_jobs"] | None = None
+    actor: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=160)] | None = (
+        None
+    )
+    date_from: date | None = None
+    date_to: date | None = None
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def valid_dates(self):
+        if self.date_from and self.date_to and self.date_from > self.date_to:
+            raise ValueError("Начало периода должно быть не позже конца")
+        return self
+
+
+@router.get(
+    "/audit",
+    response_model=view.AuditPage,
+    responses=view.errors(401, 403),
+    summary="Журнал аудита руководителя",
+)
+async def audit_log(query: Annotated[AuditQuery, Query()], db: DB, user: User):
+    start = datetime.combine(query.date_from, time.min, WORKSHOP_TIME) if query.date_from else None
+    end = datetime.combine(query.date_to, time.max, WORKSHOP_TIME) if query.date_to else None
+    return await db.run_sync(
+        inv.list_audit,
+        user,
+        entity=query.entity,
+        actor=query.actor,
+        date_from=start,
+        date_to=end,
+        offset=query.offset,
+        limit=query.limit,
+    )
 
 
 app.include_router(router)

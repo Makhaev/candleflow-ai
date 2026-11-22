@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, localcontext
 from typing import Literal
 
@@ -210,6 +210,38 @@ def receipt_list(db: Session, user: User, offset: int, limit: int) -> list[dict]
         .limit(limit)
     )
     return [{**serialize(row), "supplier": row.supplier.name} for row in db.scalars(query)]
+
+
+def list_audit(
+    db: Session,
+    user: User,
+    *,
+    entity: str | None,
+    actor: str | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    offset: int,
+    limit: int,
+) -> dict:
+    require(user, "manager")
+    conditions = []
+    if entity:
+        conditions.append(Audit.entity == entity)
+    if actor:
+        conditions.append(Audit.actor.icontains(actor, autoescape=True))
+    if date_from:
+        conditions.append(Audit.at >= date_from)
+    if date_to:
+        conditions.append(Audit.at <= date_to)
+    total = db.scalar(select(func.count()).select_from(Audit).where(*conditions))
+    rows = db.scalars(
+        select(Audit)
+        .where(*conditions)
+        .order_by(Audit.at.desc(), Audit.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return {"total": total, "items": [serialize(row) for row in rows]}
 
 
 def history(db: Session, user: User, entity: str, entity_id: int, offset: int, limit: int) -> dict:

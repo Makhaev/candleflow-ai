@@ -204,8 +204,8 @@ export function Warehouse({ user, materials, reloadCatalog }: Catalog) {
   const updateFilter = (id: string, value: string) => setFilters(previous => ({ ...previous, [id]: value }))
   return <>
     <header className="page-head"><div><h1>Партии сырья</h1><p>Поступления, проверка качества и складские остатки</p></div>
-      {canEdit && <div className="actions"><button className="secondary" onClick={() => setForm('material')}>Создать материал</button>
-        <button onClick={() => setForm('receipt')}>Новое поступление</button></div>}
+      {canEdit && <div className="actions"><button className="secondary" onClick={() => { select(null); setForm('material') }}>Создать материал</button>
+        <button onClick={() => { select(null); setForm('receipt') }}>Новое поступление</button></div>}
     </header>
     {form && <Drawer title={form === 'receipt' ? 'Новое поступление' : 'Новый материал'} close={() => setForm(null)}>
       {form === 'receipt' ? <ReceiptForm user={user} materials={materials} done={() => {
@@ -218,7 +218,7 @@ export function Warehouse({ user, materials, reloadCatalog }: Catalog) {
       <div className="panel-toolbar"><strong>Реестр партий <span className="count">{total}</span></strong>
         <button className="secondary compact" disabled={!Object.values(filters).some(Boolean)}
           onClick={() => setFilters({})}>Сбросить фильтры</button></div>
-      <div className="table-wrap"><table className="batch-table">
+      <div className="table-wrap" tabIndex={0} role="region" aria-label="Таблица партий и фильтры"><table className="batch-table">
         <thead><tr>{columns.map(column => <th key={column.id}
           aria-sort={sort.id === column.id ? (sort.descending ? 'descending' : 'ascending') : 'none'}>
           <button onClick={() => { setSort({ id: column.id, descending: sort.id === column.id && !sort.descending }); setPage(0) }}>
@@ -240,7 +240,7 @@ export function Warehouse({ user, materials, reloadCatalog }: Catalog) {
                 onChange={event => updateFilter(column.id, event.target.value)} />}
         </th>)}</tr></thead>
         <tbody>{rows.map(batch => <tr key={batch.id}>{columns.map(column => <td key={column.id}>
-          {column.id === 'id' ? <a href={'#batch-' + batch.id} onClick={() => select(batch.id)}>#{batch.id}</a>
+          {column.id === 'id' ? <a href={'#batch-' + batch.id} onClick={() => { setForm(null); select(batch.id) }}>#{batch.id}</a>
             : batchValue(batch, column.id, materials)}
         </td>)}</tr>)}</tbody>
       </table></div>
@@ -305,6 +305,8 @@ function jobStatus(job: Job) {
   return job.status === 'planned' && job.components.some(row => row.signal !== 'green') ? 'shortage' : job.status
 }
 
+const reserveLabels = { green: 'Полный резерв', yellow: 'Частичный резерв', red: 'Без резерва' }
+
 function JobCard({ id, canEdit, close, updated }: { id: number; canEdit: boolean; close: () => void; updated: () => void }) {
   const [job, setJob] = useState<Job | null>(null)
   const [cost, setCost] = useState<{ total_rub: string; kind: string } | null>(null)
@@ -321,7 +323,7 @@ function JobCard({ id, canEdit, close, updated }: { id: number; canEdit: boolean
     setBusy(true)
     setError('')
     try {
-      const path = action === 'complete' ? '/completion/' + id : '/jobs/' + id + '/' + action
+      const path = '/jobs/' + id + '/' + action
       setJob(await api<Job>(path, body))
       updated()
       setCost(await api('/jobs/' + id + '/cost'))
@@ -333,20 +335,23 @@ function JobCard({ id, canEdit, close, updated }: { id: number; canEdit: boolean
         <span>{quantity(job.quantity)} свечей</span>
         {cost && <strong>{({ actual: 'Фактическая себестоимость', issued: 'Стоимость выданного сырья', reserved: 'Стоимость резерва' })[cost.kind] ?? 'Себестоимость'} · {quantity(cost.total_rub)} ₽</strong>}
       </div>
-      <div className="table-wrap"><table>
+      <div className="table-wrap" tabIndex={0} role="region" aria-label="Компоненты задания"><table className="requirements-table">
         <thead><tr><th>Компонент</th><th>Потребность</th><th>Резерв</th>{job.status === 'in_progress' && <th>Списано при запуске</th>}<th>{job.status === 'completed' ? 'Фактический расход' : 'Дефицит'}</th></tr></thead>
         <tbody>{job.components.map(component => <tr key={component.code}>
-          <td>{['planned', 'draft'].includes(job.status) && <span className={'signal ' + component.signal}
-            role="img" aria-label={{ green: 'Полный резерв', yellow: 'Частичный резерв', red: 'Без резерва' }[component.signal]} />}
-            {component.name}</td>
+          <td><strong>{component.name}</strong>
+            {['planned', 'draft'].includes(job.status) && <small className={'reserve-label reserve-' + component.signal}>
+              <span className={'signal ' + component.signal} aria-hidden="true" />{reserveLabels[component.signal]}
+            </small>}</td>
           {[component.required, component.reserved, ...(job.status === 'in_progress' ? [component.issued] : []), job.status === 'completed' ? component.consumed : component.missing]
             .map((amount, index) => <td key={index}>{quantity(amount)} {component.unit}</td>)}
         </tr>)}</tbody></table></div>
       {canEdit && ['draft', 'planned'].includes(job.status) && <div className="actions">
         {job.status === 'draft' && <button disabled={busy} onClick={() => change('plan')}>Запланировать</button>}
-        {jobStatus(job) === 'planned' && <button disabled={busy} onClick={() => change('start')}>Запустить</button>}
+        {job.status === 'planned' && <button disabled={busy || jobStatus(job) === 'shortage'}
+          onClick={() => change('start')}>Запустить</button>}
         <button className="secondary" disabled={busy} onClick={() => change('cancel')}>Отменить задание</button>
       </div>}
+      {canEdit && jobStatus(job) === 'shortage' && <p className="muted">Для запуска нужен полный резерв по каждому компоненту.</p>}
       {canEdit && job.status === 'in_progress' && <form className="edit-form" onSubmit={event => {
         void change('complete', { actual: Object.fromEntries(formData(event)) })
       }}><fieldset><legend>Фактический расход</legend><div className="form-row">
@@ -376,8 +381,8 @@ export function Production({ user, materials, recipes, initialJob, reloadCatalog
   }, [revision, offset])
   return <>
     <header className="page-head"><div><h1>Производственные задания</h1><p>Планирование, резервы и фактический расход</p></div>
-      {canEdit && <div className="actions"><button className="secondary" onClick={() => setForm('recipe')}>Создать рецепт</button>
-        <button onClick={() => setForm('job')}>Новое задание</button></div>}</header>
+      {canEdit && <div className="actions"><button className="secondary" onClick={() => { setSelected(null); setForm('recipe') }}>Создать рецепт</button>
+        <button onClick={() => { setSelected(null); setForm('job') }}>Новое задание</button></div>}</header>
     {form && <Drawer title={form === 'job' ? 'Новое задание' : 'Новый рецепт'} close={() => setForm(null)}>
       {form === 'job' ? <PlanForm today={user.today} recipes={recipes} done={id => {
         setForm(null); setSelected(id); setOffset(0); updated()
@@ -388,7 +393,7 @@ export function Production({ user, materials, recipes, initialJob, reloadCatalog
     <section className="panel"><div className="table-wrap"><table>
       <thead><tr><th>Задание</th><th>Рецепт</th><th>Количество</th><th>Дата плана</th><th>Статус</th></tr></thead>
       <tbody>{jobs.map(job => <tr key={job.id}>
-        <td><button className="link" onClick={() => setSelected(job.id)}>#{job.id}</button></td>
+        <td><button className="link" onClick={() => { setForm(null); setSelected(job.id) }}>#{job.id}</button></td>
         <td>{job.recipe}</td><td>{quantity(job.quantity)} шт</td><td>{day(job.planned_on)}</td><td><Status value={jobStatus(job)} /></td>
       </tr>)}</tbody>
     </table></div>{!jobs.length && <p className="empty">Задания не найдены</p>}

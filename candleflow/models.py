@@ -228,7 +228,10 @@ class StockMovement(Base):
 
 class Audit(Base):
     __tablename__ = "audit_logs"
-    __table_args__ = (Index("ix_audit_logs_entity", "entity", "entity_id", "id"),)
+    __table_args__ = (
+        Index("ix_audit_logs_entity", "entity", "entity_id", "id"),
+        Index("ix_audit_logs_at_id", "at", "id"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     actor: Mapped[str]
