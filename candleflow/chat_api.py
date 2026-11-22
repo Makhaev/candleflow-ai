@@ -8,6 +8,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 
+from candleflow import api_views as view
 from candleflow import assistant as ai
 from candleflow import inventory as inv
 from candleflow.api import DB, User, today
@@ -15,16 +16,18 @@ from candleflow.auth import DomainError
 from candleflow.chat_models import Artifact, Conversation, Memory, Message
 from candleflow.privacy import Pseudonyms, sanitize_upload
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", tags=["Ассистент"], responses=view.errors(401, 422, 503))
 
 
-@router.get("/conversations")
+@router.get("/conversations", response_model=list[view.ConversationView], summary="Список моих диалогов")
 async def conversations(db: DB, user: User):
     query = select(Conversation).where(Conversation.user_id == user.id).order_by(Conversation.id.desc())
     return [inv.serialize(row) for row in await db.scalars(query.limit(100))]
 
 
-@router.post("/conversations", status_code=201)
+@router.post(
+    "/conversations", status_code=201, response_model=view.ConversationView, summary="Создать диалог"
+)
 async def new_conversation(db: DB, user: User):
     row = Conversation(user_id=user.id, title="Новый диалог")
     db.add(row)
@@ -32,7 +35,12 @@ async def new_conversation(db: DB, user: User):
     return inv.serialize(row)
 
 
-@router.get("/conversations/{key}")
+@router.get(
+    "/conversations/{key}",
+    response_model=view.ConversationDetails,
+    responses=view.errors(404),
+    summary="Диалог со всеми сообщениями",
+)
 async def get_conversation(key: int, db: DB, user: User):
     row = await db.run_sync(ai.conversation, user.id, key)
     messages = await db.scalars(select(Message).where(Message.conversation_id == key).order_by(Message.id))
@@ -42,7 +50,24 @@ async def get_conversation(key: int, db: DB, user: User):
     }
 
 
-@router.post("/conversations/{key}/stream")
+@router.post(
+    "/conversations/{key}/stream",
+    response_class=StreamingResponse,
+    summary="Отправить сообщение и получать ответ по SSE",
+    description="Multipart-поля question и upload. Поток передаёт data как JSON. События start (id), delta (text), "
+    "tool (name), reset (text, retry), done (message). При остановке статус доступен в диалоге.",
+    responses={
+        **view.errors(404, 409, 413),
+        200: {
+            "content": {
+                "text/event-stream": {
+                    "schema": {"type": "string"},
+                    "example": 'data: {"type":"delta","text":"Склад"}\n\n',
+                }
+            }
+        },
+    },
+)
 async def stream(
     key: int,
     db: DB,
@@ -94,26 +119,35 @@ async def stream(
     )
 
 
-@router.post("/messages/{key}/stop", status_code=204)
+@router.post(
+    "/messages/{key}/stop", status_code=204, responses=view.errors(404), summary="Остановить генерацию"
+)
 async def stop(key: int, db: DB, user: User):
     await db.run_sync(ai.request_stop, user.id, key)
     await db.commit()
     return Response(status_code=204)
 
 
-@router.post("/messages/{key}/confirm")
+@router.post(
+    "/messages/{key}/confirm",
+    response_model=view.JobView | view.ConfirmedView,
+    responses=view.errors(403, 404, 409),
+    summary="Подтвердить действие один раз",
+)
 async def confirm(key: int, db: DB, user: User):
     result = await db.run_sync(ai.confirm, user, key)
     await db.commit()
     return result
 
 
-@router.get("/memory")
+@router.get("/memory", response_model=list[view.MemoryView], summary="Мои сохранённые предпочтения")
 async def memory(db: DB, user: User):
     return [inv.serialize(row) for row in await db.run_sync(ai.preferences, user.id)]
 
 
-@router.delete("/memory/{key}", status_code=204)
+@router.delete(
+    "/memory/{key}", status_code=204, responses=view.errors(404), summary="Удалить своё предпочтение"
+)
 async def delete_memory(key: int, db: DB, user: User):
     row = await db.scalar(select(Memory).where(Memory.id == key, Memory.user_id == user.id))
     if row is None:
@@ -123,7 +157,21 @@ async def delete_memory(key: int, db: DB, user: User):
     return Response(status_code=204)
 
 
-@router.get("/artifacts/{key}")
+@router.get("/artifacts/{key}", include_in_schema=False)
+@router.get(
+    "/files/{key}",
+    response_class=Response,
+    summary="Скачать файл своего диалога",
+    responses={
+        **view.errors(404),
+        200: {
+            "content": {
+                mime: {"schema": {"type": "string", "format": "binary"}} for mime in ai.MIMES.values()
+            },
+            "headers": {"Content-Disposition": {"schema": {"type": "string"}}},
+        },
+    },
+)
 async def download(key: int, db: DB, user: User):
     row = await db.get(Artifact, key)
     if row is None:

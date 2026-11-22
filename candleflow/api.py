@@ -7,17 +7,20 @@ import httpx
 from fastapi import APIRouter, Cookie, Depends, FastAPI, Query, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyCookie
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from candleflow import api_views as view
 from candleflow import inventory as inv
 from candleflow.auth import DomainError, authenticate, login, token_hash
 from candleflow.db import AsyncSessionLocal
 from candleflow.models import Job, LoginSession, Material, Recipe
 from candleflow.rates import fetch_quote
 from candleflow.schemas import (
+    Code,
     Completion,
     Inspection,
     JobInput,
@@ -29,8 +32,11 @@ from candleflow.schemas import (
 )
 
 app = FastAPI(title="CandleFlow")
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", tags=["Учёт"], responses=view.errors(422, 503))
 COOKIE = "candleflow_session"
+session_cookie = APIKeyCookie(name=COOKIE, scheme_name="CandleFlowSession", auto_error=False)
+PageOffset = Annotated[int, Query(ge=0)]
+PageLimit = Annotated[int, Query(ge=1, le=100)]
 
 
 def today() -> date:
@@ -51,7 +57,7 @@ DB = Annotated[AsyncSession, Depends(get_db)]
 RateClient = Annotated[httpx.AsyncClient, Depends(get_rate_client)]
 
 
-async def current_user(db: DB, token: Annotated[str | None, Cookie(alias=COOKIE)] = None):
+async def current_user(db: DB, token: Annotated[str | None, Depends(session_cookie)]):
     return await db.run_sync(authenticate, token)
 
 
@@ -83,7 +89,9 @@ def public_user(user: inv.User) -> dict:
     return {"id": user.id, "name": user.full_name, "role": user.role}
 
 
-@router.post("/login")
+@router.post(
+    "/login", response_model=view.UserView, tags=["Сессия"], responses=view.errors(401), summary="Войти"
+)
 async def sign_in(data: Login, response: Response, db: DB):
     user, token = await db.run_sync(login, data.login, data.password)
     await db.commit()
@@ -91,7 +99,7 @@ async def sign_in(data: Login, response: Response, db: DB):
     return public_user(user)
 
 
-@router.post("/logout")
+@router.post("/logout", response_model=view.OkView, tags=["Сессия"], summary="Выйти")
 async def sign_out(response: Response, db: DB, token: Annotated[str | None, Cookie(alias=COOKIE)] = None):
     entry = await db.get(LoginSession, token_hash(token)) if token else None
     if entry:
@@ -101,37 +109,65 @@ async def sign_out(response: Response, db: DB, token: Annotated[str | None, Cook
     return {"ok": True}
 
 
-@router.get("/me")
+@router.get(
+    "/me",
+    response_model=view.SessionView,
+    tags=["Сессия"],
+    responses=view.errors(401),
+    summary="Текущая сессия",
+)
 def me(user: User):
     day = today()
     return {**public_user(user), "today": day, "week_start": day - timedelta(days=day.weekday())}
 
 
-@app.get("/health")
+@app.get("/health", response_model=view.HealthView, summary="Проверка доступности API")
 def health():
     return {"ok": True, "at": datetime.now(UTC)}
 
 
-@router.get("/materials")
+@router.get(
+    "/materials",
+    response_model=list[view.MaterialView],
+    responses=view.errors(401, 403),
+    summary="Список материалов",
+)
 async def materials(db: DB, user: User):
     inv.require(user, *inv.READERS)
     return [inv.serialize(row) for row in await db.scalars(select(Material).order_by(Material.code))]
 
 
-@router.post("/materials", status_code=201)
+@router.post(
+    "/materials",
+    status_code=201,
+    response_model=view.MaterialView,
+    responses=view.errors(401, 403, 409),
+    summary="Создать материал",
+)
 async def create_material(data: MaterialInput, db: DB, user: User):
     result = await db.run_sync(inv.add_material, user, data)
     await db.commit()
     return result
 
 
-@router.get("/recipes")
+@router.get(
+    "/recipes",
+    response_model=list[view.RecipeView],
+    responses=view.errors(401, 403),
+    summary="Список рецептов",
+)
 async def recipes(db: DB, user: User):
     inv.require(user, *inv.READERS)
     return [inv.serialize(row) for row in await db.scalars(select(Recipe).order_by(Recipe.id))]
 
 
-@router.post("/recipes", status_code=201)
+@router.post(
+    "/recipes",
+    status_code=201,
+    response_model=view.RecipeView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Создать рецепт",
+)
 async def create_recipe(data: RecipeInput, db: DB, user: User):
     result = await db.run_sync(inv.add_recipe, user, data)
     await db.commit()
@@ -140,6 +176,7 @@ async def create_recipe(data: RecipeInput, db: DB, user: User):
 
 class BatchQuery(BaseModel):
     id: int | None = None
+    receipt_id: int | None = None
     material_code: str | None = None
     supplier: str | None = None
     received_on: date | None = None
@@ -155,6 +192,7 @@ class BatchQuery(BaseModel):
     comment: str | None = None
     sort: Literal[
         "id",
+        "receipt_id",
         "material_code",
         "supplier",
         "received_on",
@@ -174,7 +212,12 @@ class BatchQuery(BaseModel):
     limit: int = Field(default=20, ge=1, le=100)
 
 
-@router.get("/batches")
+@router.get(
+    "/batches",
+    response_model=view.BatchPage,
+    responses=view.errors(401, 403),
+    summary="Фильтрация и пагинация партий",
+)
 async def batches(query: Annotated[BatchQuery, Query()], db: DB, user: User):
     filters = query.model_dump(exclude={"sort", "descending", "offset", "limit"})
     return await db.run_sync(
@@ -188,7 +231,13 @@ async def batches(query: Annotated[BatchQuery, Query()], db: DB, user: User):
     )
 
 
-@router.post("/receipts", status_code=201)
+@router.post(
+    "/receipts",
+    status_code=201,
+    response_model=list[view.BatchView],
+    responses=view.errors(401, 403, 404, 409),
+    summary="Создать поступление и его партии",
+)
 async def receipt(data: ReceiptInput, db: DB, user: User, client: RateClient):
     inv.require(user, "storekeeper", "manager")
     quotes = {
@@ -200,78 +249,213 @@ async def receipt(data: ReceiptInput, db: DB, user: User, client: RateClient):
     return result
 
 
-@router.get("/batches/{batch_id}")
+@router.get(
+    "/batches/{batch_id}",
+    response_model=view.BatchDetails,
+    responses=view.errors(401, 403, 404),
+    summary="Карточка партии с аудитом",
+)
 async def batch(batch_id: int, db: DB, user: User):
     return await db.run_sync(inv.batch_history, user, batch_id)
 
 
-@router.post("/batches/{batch_id}/inspection")
+@router.post(
+    "/batches/{batch_id}/inspection",
+    response_model=view.BatchView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Принять или забраковать партию",
+)
 async def inspection(batch_id: int, data: Inspection, db: DB, user: User):
     result = await db.run_sync(inv.inspect_batch, user, batch_id, data.status)
     await db.commit()
     return result
 
 
-@router.get("/stock/{material_code}")
-async def stock(material_code: str, db: DB, user: User):
+@router.get(
+    "/stock/{material_code}",
+    response_model=view.StockView,
+    responses=view.errors(401, 403, 404),
+    summary="Остатки материала",
+)
+async def stock(material_code: Code, db: DB, user: User):
     return await db.run_sync(inv.stock, user, material_code)
 
 
-@router.get("/jobs")
+@router.get(
+    "/jobs",
+    response_model=list[view.JobView],
+    responses=view.errors(401, 403),
+    summary="Список производственных заданий",
+)
 async def jobs(db: DB, user: User, offset: Annotated[int, Query(ge=0)] = 0):
     inv.require(user, *inv.READERS)
     keys = await db.scalars(select(Job.id).order_by(Job.id.desc()).offset(offset).limit(50))
     return await db.run_sync(lambda sync: [inv.job_detail(sync, user, key) for key in keys])
 
 
-@router.get("/jobs/shortages")
+@router.get(
+    "/jobs/shortages",
+    response_model=list[view.JobView],
+    responses=view.errors(401, 403),
+    summary="Дефициты за период",
+)
 async def shortages(period: Annotated[Period, Query()], db: DB, user: User):
     return await db.run_sync(inv.shortages, user, period)
 
 
-@router.post("/jobs", status_code=201)
+@router.post(
+    "/jobs",
+    status_code=201,
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Создать и запланировать задание одной операцией",
+)
 async def create_job(data: JobInput, db: DB, user: User):
     result = await db.run_sync(inv.plan, user, data)
     await db.commit()
     return result
 
 
-@router.post("/jobs/drafts", status_code=201)
+@router.post(
+    "/jobs/drafts",
+    status_code=201,
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Создать черновик задания",
+)
 async def draft(data: JobInput, db: DB, user: User):
     result = await db.run_sync(inv.create_draft, user, data)
     await db.commit()
     return result
 
 
-@router.post("/jobs/{job_id}/plan")
+@router.post(
+    "/jobs/{job_id}/plan",
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Запланировать черновик и зарезервировать материал",
+)
 async def plan_existing(job_id: int, db: DB, user: User):
     result = await db.run_sync(inv.plan_draft, user, job_id)
     await db.commit()
     return result
 
 
-@router.get("/jobs/{job_id}")
+@router.get(
+    "/jobs/{job_id}",
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404),
+    summary="Карточка задания",
+)
 async def job(job_id: int, db: DB, user: User):
     return await db.run_sync(inv.job_detail, user, job_id)
 
 
-@router.get("/jobs/{job_id}/cost")
+@router.get(
+    "/jobs/{job_id}/cost",
+    response_model=view.CostView,
+    responses=view.errors(401, 403, 404),
+    summary="Себестоимость задания",
+)
 async def cost(job_id: int, db: DB, user: User):
     return await db.run_sync(inv.job_cost, user, job_id)
 
 
-@router.post("/jobs/{job_id}/{action}")
-async def transition(job_id: int, action: Literal["start", "cancel"], db: DB, user: User):
-    result = await db.run_sync(inv.job_transition, user, job_id, action)
+@router.post(
+    "/jobs/{job_id}/start",
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Запустить задание и списать сырьё",
+)
+async def start_job(job_id: int, db: DB, user: User):
+    result = await db.run_sync(inv.job_transition, user, job_id, "start")
     await db.commit()
     return result
 
 
-@router.post("/completion/{job_id}")
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Отменить задание и снять резерв",
+)
+async def cancel_job(job_id: int, db: DB, user: User):
+    result = await db.run_sync(inv.job_transition, user, job_id, "cancel")
+    await db.commit()
+    return result
+
+
+@router.post("/completion/{job_id}", response_model=view.JobView, include_in_schema=False)
+@router.post(
+    "/jobs/{job_id}/complete",
+    response_model=view.JobView,
+    responses=view.errors(401, 403, 404, 409),
+    summary="Завершить задание по фактическому расходу",
+)
 async def completion(job_id: int, data: Completion, db: DB, user: User):
     result = await db.run_sync(inv.complete, user, job_id, data, today())
     await db.commit()
     return result
+
+
+@router.get(
+    "/materials/{code}",
+    response_model=view.MaterialView,
+    responses=view.errors(401, 403, 404),
+    summary="Карточка материала",
+)
+async def material(code: Code, db: DB, user: User):
+    return await db.run_sync(inv.material_view, user, code)
+
+
+@router.get(
+    "/recipes/{recipe_id}",
+    response_model=view.RecipeDetails,
+    responses=view.errors(401, 403, 404),
+    summary="Рецепт и нормы расхода",
+)
+async def recipe(recipe_id: int, db: DB, user: User):
+    return await db.run_sync(inv.recipe_view, user, recipe_id)
+
+
+@router.get(
+    "/receipts",
+    response_model=list[view.ReceiptView],
+    responses=view.errors(401, 403),
+    summary="Список поступлений",
+)
+async def receipts(db: DB, user: User, offset: PageOffset = 0, limit: PageLimit = 20):
+    return await db.run_sync(inv.receipt_list, user, offset, limit)
+
+
+@router.get(
+    "/receipts/{receipt_id}",
+    response_model=view.ReceiptDetails,
+    responses=view.errors(401, 403, 404),
+    summary="Поступление и его партии",
+)
+async def receipt_details(receipt_id: int, db: DB, user: User):
+    return await db.run_sync(inv.receipt_view, user, receipt_id)
+
+
+@router.get(
+    "/batches/{batch_id}/history",
+    response_model=view.HistoryView,
+    responses=view.errors(401, 403, 404),
+    summary="Аудит и движения по партии",
+)
+async def batch_history(batch_id: int, db: DB, user: User, offset: PageOffset = 0, limit: PageLimit = 20):
+    return await db.run_sync(inv.history, user, "batches", batch_id, offset, limit)
+
+
+@router.get(
+    "/jobs/{job_id}/history",
+    response_model=view.HistoryView,
+    responses=view.errors(401, 403, 404),
+    summary="Аудит и движения по заданию",
+)
+async def job_history(job_id: int, db: DB, user: User, offset: PageOffset = 0, limit: PageLimit = 20):
+    return await db.run_sync(inv.history, user, "production_jobs", job_id, offset, limit)
 
 
 app.include_router(router)

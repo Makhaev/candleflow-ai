@@ -4,8 +4,9 @@ from decimal import Decimal, localcontext
 from typing import Literal
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import Select, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import Select, func, inspect, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session, joinedload
 
 from candleflow.auth import DomainError, require
 from candleflow.models import (
@@ -13,15 +14,20 @@ from candleflow.models import (
     Audit,
     Batch,
     Component,
+    ExchangeRate,
     Ingredient,
     Job,
     Material,
     Outbox,
+    Receipt,
     Recipe,
+    StockMovement,
+    Supplier,
     User,
 )
 from candleflow.rates import RateQuote, mock_quote
 from candleflow.schemas import Completion, JobInput, MaterialInput, Period, ReceiptInput, RecipeInput
+from candleflow.suppliers import supplier_key
 
 ZERO = Decimal(0)
 READERS = ("storekeeper", "technologist", "manager")
@@ -29,7 +35,15 @@ PRODUCTION = ("technologist", "manager")
 
 
 def serialize(value: object) -> dict:
-    return jsonable_encoder(vars(value), custom_encoder={Decimal: str})
+    data = {column.key: getattr(value, column.key) for column in inspect(value).mapper.column_attrs}
+    if isinstance(value, Batch):
+        data.update(
+            supplier=value.receipt.supplier.name,
+            currency=value.quote.currency,
+            exchange_rate=value.quote.rate,
+            exchange_rate_on=value.quote.quoted_on,
+        )
+    return jsonable_encoder(data, custom_encoder={Decimal: str})
 
 
 def audit(db: Session, user: User, obj: object, before: dict | None = None) -> None:
@@ -37,6 +51,7 @@ def audit(db: Session, user: User, obj: object, before: dict | None = None) -> N
     key = obj.code if isinstance(obj, Material) else obj.id
     db.add(
         Audit(
+            actor_id=user.id,
             actor=user.full_name,
             entity=obj.__tablename__,
             entity_id=str(key),
@@ -46,11 +61,43 @@ def audit(db: Session, user: User, obj: object, before: dict | None = None) -> N
     )
 
 
+def stock_movement(
+    db: Session, user: User, batch: Batch, kind: str, before: dict | None = None, job_id: int | None = None
+) -> None:
+    previous = before or {}
+    db.add(
+        StockMovement(
+            batch_id=batch.id,
+            actor_id=user.id,
+            job_id=job_id,
+            kind=kind,
+            physical_delta=batch.quantity - Decimal(previous.get("quantity", 0)),
+            reserved_delta=batch.reserved - Decimal(previous.get("reserved", 0)),
+        )
+    )
+
+
 def get_or_fail(db: Session, model, key, *, lock: bool = False):
     obj = db.get(model, key, with_for_update=lock)
     if obj is None:
         raise DomainError("Запись не найдена", 404)
     return obj
+
+
+def material_view(db: Session, user: User, code: str) -> dict:
+    require(user, *READERS)
+    return serialize(get_or_fail(db, Material, code))
+
+
+def recipe_view(db: Session, user: User, recipe_id: int) -> dict:
+    require(user, *READERS)
+    recipe = get_or_fail(db, Recipe, recipe_id)
+    ingredients = db.execute(
+        select(Ingredient.material_code, Ingredient.per_unit)
+        .where(Ingredient.recipe_id == recipe.id)
+        .order_by(Ingredient.material_code)
+    )
+    return {**serialize(recipe), "ingredients": {code: str(amount) for code, amount in ingredients}}
 
 
 def add_material(db: Session, user: User, data: MaterialInput) -> dict:
@@ -81,28 +128,113 @@ def receive(
     db: Session, user: User, receipt: ReceiptInput, quotes: dict[str, RateQuote] | None = None
 ) -> list[dict]:
     require(user, "storekeeper", "manager")
+    key = supplier_key(receipt.supplier)
+    supplier = db.scalar(
+        insert(Supplier)
+        .values(name=receipt.supplier, normalized_name=key)
+        .on_conflict_do_nothing(index_elements=[Supplier.normalized_name])
+        .returning(Supplier)
+    )
+    if supplier is None:
+        supplier = db.scalar(select(Supplier).where(Supplier.normalized_name == key))
+    document = Receipt(supplier=supplier, received_on=receipt.received_on, created_by=user.id)
+    db.add(document)
+    audit(db, user, document)
+    rate_rows: dict[str, ExchangeRate] = {}
+    for currency in sorted({line.currency for line in receipt.lines}):
+        quote = quotes[currency] if quotes else mock_quote(currency, receipt.received_on)
+        row = db.scalar(
+            insert(ExchangeRate)
+            .values(currency=currency, quoted_on=quote.day, rate=quote.rate)
+            .on_conflict_do_nothing(
+                index_elements=[ExchangeRate.currency, ExchangeRate.quoted_on, ExchangeRate.rate]
+            )
+            .returning(ExchangeRate)
+        )
+        if row is None:
+            row = db.scalar(
+                select(ExchangeRate).where(
+                    ExchangeRate.currency == currency,
+                    ExchangeRate.quoted_on == quote.day,
+                    ExchangeRate.rate == quote.rate,
+                )
+            )
+        rate_rows[currency] = row
     batches = []
     for line in receipt.lines:
         get_or_fail(db, Material, line.material_code)
-        quote = quotes[line.currency] if quotes else mock_quote(line.currency, receipt.received_on)
+        quote = rate_rows[line.currency]
         batch = Batch(
+            receipt=document,
+            received_on=document.received_on,
+            quote=quote,
             material_code=line.material_code,
-            supplier=receipt.supplier,
-            received_on=receipt.received_on,
             received=line.quantity,
             quantity=line.quantity,
             unit_price=line.unit_price,
-            currency=line.currency,
-            exchange_rate=quote.rate,
-            exchange_rate_on=quote.day,
             unit_cost=line.unit_price * quote.rate,
             status="on_review",
             comment=line.comment,
         )
         db.add(batch)
         audit(db, user, batch)
+        stock_movement(db, user, batch, "receipt")
         batches.append(serialize(batch))
     return batches
+
+
+def batch_rows():
+    return select(Batch).options(
+        joinedload(Batch.receipt).joinedload(Receipt.supplier), joinedload(Batch.quote)
+    )
+
+
+def receipt_view(db: Session, user: User, receipt_id: int) -> dict:
+    require(user, *READERS)
+    receipt = get_or_fail(db, Receipt, receipt_id)
+    batches = db.scalars(batch_rows().where(Batch.receipt_id == receipt_id).order_by(Batch.id))
+    return {
+        **serialize(receipt),
+        "supplier": receipt.supplier.name,
+        "batches": [serialize(batch) for batch in batches],
+    }
+
+
+def receipt_list(db: Session, user: User, offset: int, limit: int) -> list[dict]:
+    require(user, *READERS)
+    query = (
+        select(Receipt)
+        .options(joinedload(Receipt.supplier))
+        .order_by(Receipt.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return [{**serialize(row), "supplier": row.supplier.name} for row in db.scalars(query)]
+
+
+def history(db: Session, user: User, entity: str, entity_id: int, offset: int, limit: int) -> dict:
+    require(user, *READERS)
+    model = Batch if entity == "batches" else Job
+    get_or_fail(db, model, entity_id)
+    audit_rows = db.scalars(
+        select(Audit)
+        .where(Audit.entity == entity, Audit.entity_id == str(entity_id))
+        .order_by(Audit.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    column = StockMovement.batch_id if entity == "batches" else StockMovement.job_id
+    movements = db.scalars(
+        select(StockMovement)
+        .where(column == entity_id)
+        .order_by(StockMovement.id)
+        .offset(offset)
+        .limit(limit)
+    )
+    return {
+        "history": [serialize(row) for row in audit_rows],
+        "movements": [serialize(row) for row in movements],
+    }
 
 
 def inspect_batch(db: Session, user: User, batch_id: int, status: str) -> dict:
@@ -130,7 +262,13 @@ def batch_list(
 ) -> dict:
     require(user, *READERS)
     columns = {column.name: getattr(Batch, column.name) for column in Batch.__table__.columns}
-    query = select(Batch)
+    columns.update(
+        supplier=Supplier.name,
+        currency=ExchangeRate.currency,
+        exchange_rate=ExchangeRate.rate,
+        exchange_rate_on=ExchangeRate.quoted_on,
+    )
+    query = select(Batch).join(Batch.receipt).join(Receipt.supplier).join(Batch.quote)
     for key, value in filters.items():
         if value is None or value == "":
             continue
@@ -141,7 +279,10 @@ def batch_list(
     total = db.scalar(select(func.count()).select_from(query.subquery()))
     column = columns[sort]
     rows = db.scalars(
-        query.order_by(column.desc() if descending else column.asc(), Batch.id).offset(offset).limit(limit)
+        query.options(joinedload(Batch.receipt).joinedload(Receipt.supplier), joinedload(Batch.quote))
+        .order_by(column.desc() if descending else column.asc(), Batch.id)
+        .offset(offset)
+        .limit(limit)
     )
     return {"total": total, "items": [serialize(row) for row in rows]}
 
@@ -218,8 +359,9 @@ def plan_draft(db: Session, user: User, job_id: int) -> dict:
             if take:
                 before = serialize(batch)
                 batch.reserved += take
-                db.add(Allocation(job_id=job.id, batch_id=batch.id, reserved=take))
+                db.add(Allocation(job_id=job.id, batch_id=batch.id, reserved=take, state="active"))
                 audit(db, user, batch, before)
+                stock_movement(db, user, batch, "reserve", before, job.id)
                 need -= take
             if not need:
                 break
@@ -305,7 +447,9 @@ def job_transition(db: Session, user: User, job_id: int, action: Literal["start"
             batch.quantity -= allocation.reserved
             allocation.issued = allocation.reserved
         allocation.reserved = ZERO
+        allocation.state = "issued" if action == "start" else "released"
         audit(db, user, batch, before_batch)
+        stock_movement(db, user, batch, "issue" if action == "start" else "release", before_batch, job_id)
     job.status = "in_progress" if action == "start" else "cancelled"
     audit(db, user, job, before)
     return job_detail(db, user, job_id)
@@ -327,12 +471,14 @@ def complete(db: Session, user: User, job_id: int, data: Completion, today: date
             if allocation and allocation.issued:
                 used = min(allocation.issued, need)
                 returned = allocation.issued - used
+                allocation.state = "settled"
                 allocation.consumed = used
                 need -= used
                 if returned:
                     before = serialize(batch)
                     batch.quantity += returned
                     audit(db, user, batch, before)
+                    stock_movement(db, user, batch, "return", before, job_id)
         for batch in batches:
             if not need:
                 break
@@ -341,12 +487,13 @@ def complete(db: Session, user: User, job_id: int, data: Completion, today: date
                 before = serialize(batch)
                 allocation = own.get(batch.id)
                 if allocation is None:
-                    allocation = Allocation(job_id=job_id, batch_id=batch.id, consumed=ZERO)
+                    allocation = Allocation(job_id=job_id, batch_id=batch.id, consumed=ZERO, state="settled")
                     db.add(allocation)
                 allocation.consumed += used
                 batch.quantity -= used
                 need -= used
                 audit(db, user, batch, before)
+                stock_movement(db, user, batch, "overrun", before, job_id)
         if need:
             material = get_or_fail(db, Material, code)
             raise DomainError(f"Не хватает {need} {material.unit} · {material.name}")

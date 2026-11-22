@@ -5,7 +5,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, localcontext
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from candleflow import inventory as inv
 from candleflow.auth import DomainError
-from candleflow.chat_models import Artifact, Conversation, Memory, Message, PendingAction
+from candleflow.chat_models import Artifact, Conversation, Memory, Message, PendingAction, ToolExecution
 from candleflow.config import settings
 from candleflow.db import AsyncSessionLocal
 from candleflow.grounding import interpreter_numbers, numbers
@@ -106,10 +106,17 @@ def message_view(db: Session, row: Message) -> dict:
     files = db.execute(
         select(Artifact.id, Artifact.filename, Artifact.mime).where(Artifact.message_id == row.id)
     )
+    executions = list(
+        db.scalars(
+            select(ToolExecution).where(ToolExecution.message_id == row.id).order_by(ToolExecution.ordinal)
+        )
+    )
     proposal = db.get(PendingAction, row.id) if row.status == "complete" else None
     return {
         **inv.serialize(row),
         "files": [dict(file._mapping) for file in files],
+        "tools": [item.name for item in executions],
+        "tool_calls": [inv.serialize(item) for item in executions],
         "proposal": inv.serialize(proposal) if proposal else None,
     }
 
@@ -210,7 +217,9 @@ def invoke(
                 with localcontext() as arithmetic:
                     arithmetic.prec = 64
                     result["converted"] = str(
-                        (Decimal(result["total_rub"]) / quote.rate).quantize(Decimal("0.01"))
+                        (Decimal(result["total_rub"]) / quote.rate).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_EVEN
+                        )
                     )
                 result["rate_on"] = str(quote.day)
             return result, None
@@ -320,19 +329,27 @@ async def snapshot(
     body: str,
     status: str,
     model: str | None,
-    tools: list,
     code: list,
     attempts: list,
-    tool_calls: list,
 ) -> dict:
     async with AsyncSessionLocal.begin() as db:
         row = await db.get(Message, message_id, with_for_update=True)
         row.body = body
         row.status = "interrupted" if row.stop_requested else status
-        row.model, row.tools, row.code = model, tools, code
-        row.attempts, row.tool_calls = attempts, tool_calls
+        row.model, row.code, row.attempts = model, code, attempts
         await db.flush()
         return await db.run_sync(message_view, row)
+
+
+async def record_tool(message_id: int, ordinal: int, name: str, model: str | None, status: str) -> None:
+    async with AsyncSessionLocal.begin() as db:
+        db.add(ToolExecution(message_id=message_id, ordinal=ordinal, name=name, model=model, status=status))
+
+
+async def finish_tool(message_id: int, ordinal: int, status: str) -> None:
+    async with AsyncSessionLocal.begin() as db:
+        entry = await db.get(ToolExecution, (message_id, ordinal))
+        entry.status = status
 
 
 def request_stop(db: Session, user_id: int, message_id: int) -> None:
@@ -362,7 +379,8 @@ async def generate(
 ) -> AsyncIterator[dict]:
     body, pending, guarded, status = "", "", "", "interrupted"
     active_model = selected_model = None
-    called, code, files, attempts, tool_calls = [], [], [], [], []
+    code, files, attempts = [], [], []
+    ordinal = 0
     evidence: set[Decimal] = set()
 
     def on_model(model: str):
@@ -436,13 +454,9 @@ async def generate(
             calls = [item for item in output if item["type"] == "function_call"]
             for item in output:
                 if item["type"] == "code_interpreter_call":
-                    called.append("code_interpreter")
-                    tool_calls.append(
-                        {
-                            "name": "code_interpreter",
-                            "model": active_model,
-                            "status": item.get("status") or "unknown",
-                        }
+                    ordinal += 1
+                    await record_tool(
+                        message_id, ordinal, "code_interpreter", active_model, item.get("status") or "unknown"
                     )
                     if item.get("code"):
                         code.append(aliases.mask(item["code"]))
@@ -462,9 +476,8 @@ async def generate(
                 break
             for call in calls:
                 name = call["name"] if call["name"] in TOOLS else "unknown"
-                called.append(name)
-                record = {"name": name, "model": active_model, "status": "interrupted"}
-                tool_calls.append(record)
+                ordinal += 1
+                await record_tool(message_id, ordinal, name, active_model, "interrupted")
                 yield {"type": "tool", "name": name}
                 try:
                     async with AsyncSessionLocal.begin() as db:
@@ -477,7 +490,7 @@ async def generate(
                 except ValidationError:
                     result, dataset = {"error": "Проверьте параметры инструмента"}, None
                 safe_result = aliases.mask(result)
-                record["status"] = "error" if "error" in result else "complete"
+                await finish_tool(message_id, ordinal, "error" if "error" in result else "complete")
                 if dataset:
                     files.append(await provider.upload(result["dataset"], dataset))
                 if "error" not in result:
@@ -500,9 +513,7 @@ async def generate(
         if pending and not guarded and not numbers(pending):
             body += aliases.restore(pending)
         with CancelScope(shield=True):
-            final = await snapshot(
-                message_id, body.strip(), status, active_model, called, code, attempts, tool_calls
-            )
+            final = await snapshot(message_id, body.strip(), status, active_model, code, attempts)
         if provider:
             with move_on_after(8, shield=True):
                 try:

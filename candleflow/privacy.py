@@ -13,7 +13,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from candleflow.auth import DomainError
-from candleflow.models import Batch, User
+from candleflow.chat_models import PseudonymMapping
+from candleflow.models import Supplier, User
 
 LEGAL = r"(?:ооо|ао|пао|ип|зао|oao|llc|ltd)"
 BOUNDARY = r"[^\w]{0,8}"
@@ -45,7 +46,8 @@ class Pseudonyms:
     def __init__(self, db: Session):
         self.rules: list[tuple[re.Pattern, str]] = []
         self.originals: dict[str, str] = {}
-        for user_id, name in db.execute(select(User.id, User.full_name).order_by(User.id)):
+        people = select(PseudonymMapping.alias, User.full_name).join(User).order_by(User.id)
+        for alias, name in db.execute(people):
             parts = re.findall(r"[\w-]+", name)
             if not parts:
                 continue
@@ -60,15 +62,13 @@ class Pseudonyms:
                 first_forms = rf"(?:{full_first}{ENDINGS}|{root_first}(?:е|у|ой|ы|а))"
                 patterns.insert(0, rf"{surname_forms}{BOUNDARY}(?:{first_forms}|{first}\.?)")
                 patterns.insert(0, rf"{first_forms}{BOUNDARY}{surname_forms}")
-            self.add(f"EMPLOYEE_{user_id}", name, "|".join(patterns))
-        suppliers: dict[str, tuple[int, str]] = {}
-        for name, first_id in db.execute(select(Batch.supplier, Batch.id).order_by(Batch.id)):
-            tokens = [part for part in re.findall(r"\w+", name.casefold()) if not re.fullmatch(LEGAL, part)]
-            if tokens:
-                suppliers.setdefault(" ".join(tokens), (first_id, name))
-        for canonical, (first_id, name) in sorted(suppliers.items(), key=lambda item: -len(item[0])):
+            self.add(alias, name, "|".join(patterns))
+        suppliers = db.execute(
+            select(PseudonymMapping.alias, Supplier.name, Supplier.normalized_name).join(Supplier)
+        )
+        for alias, name, canonical in sorted(suppliers, key=lambda row: -len(row.normalized_name)):
             words = BOUNDARY.join(re.escape(token) for token in canonical.split())
-            self.add(f"SUPPLIER_{first_id}", name, rf"(?:{LEGAL}{BOUNDARY})?{words}(?:{BOUNDARY}{LEGAL})?")
+            self.add(alias, name, rf"(?:{LEGAL}{BOUNDARY})?{words}(?:{BOUNDARY}{LEGAL})?")
 
     def add(self, alias: str, original: str, pattern: str) -> None:
         self.rules.append((re.compile(rf"(?<!\w)(?:{pattern})(?!\w)", re.IGNORECASE), alias))
