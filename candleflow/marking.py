@@ -1,0 +1,64 @@
+from datetime import UTC, datetime, timedelta
+
+import httpx
+from celery import Celery
+from sqlalchemy import func, select
+
+from candleflow.config import settings
+from candleflow.db import SessionLocal
+from candleflow.models import Attempt, Outbox
+
+celery = Celery("candleflow", broker=settings.redis_url)
+celery.conf.update(
+    task_ignore_result=True,
+    task_serializer="json",
+    accept_content=["json"],
+    beat_schedule={"dispatch-marking": {"task": "marking.dispatch", "schedule": 3}},
+)
+
+
+def idempotency_key(job_id: int) -> str:
+    return f"candleflow-job-{job_id}"
+
+
+def deliver_one(client: httpx.Client, now: datetime) -> bool:
+    with SessionLocal.begin() as db:
+        item = db.scalar(
+            select(Outbox)
+            .where(
+                Outbox.delivered.is_(False),
+                Outbox.next_at <= now,
+            )
+            .order_by(Outbox.next_at, Outbox.job_id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        if item is None:
+            return False
+        count = db.scalar(select(func.count()).select_from(Attempt).where(Attempt.job_id == item.job_id))
+        number = count + 1
+        try:
+            response = client.post(
+                settings.marking_url + "/reports",
+                json=item.payload,
+                headers={"Idempotency-Key": idempotency_key(item.job_id)},
+                timeout=3,
+            )
+            outcome = str(response.status_code)
+            item.delivered = response.is_success
+        except httpx.TimeoutException:
+            outcome = "timeout"
+        except httpx.RequestError:
+            outcome = "unavailable"
+        db.add(Attempt(job_id=item.job_id, number=number, outcome=outcome))
+        if not item.delivered:
+            item.next_at = now + timedelta(seconds=min(900, 5 * 2 ** min(number - 1, 8)))
+    return True
+
+
+@celery.task(name="marking.dispatch")
+def dispatch() -> None:
+    with httpx.Client() as client:
+        for _ in range(10):
+            if not deliver_one(client, datetime.now(UTC)):
+                break

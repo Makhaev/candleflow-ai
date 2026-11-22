@@ -1,0 +1,66 @@
+x-backend: &backend
+  build: .
+  image: candleflow-backend:local
+  environment:
+    DATABASE_URL: postgresql+psycopg://candleflow:candleflow@db:5432/candleflow
+    REDIS_URL: redis://redis:6379/0
+    MARKING_URL: http://marking:8001
+    AI_PROVIDER: ${AI_PROVIDER:-fake}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    PRIMARY_MODEL: ${PRIMARY_MODEL:-gpt-5-mini}
+    FALLBACK_MODEL: ${FALLBACK_MODEL:-gpt-6-luna}
+    LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: candleflow
+      POSTGRES_PASSWORD: candleflow
+      POSTGRES_DB: candleflow
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U candleflow -d candleflow"]
+      interval: 2s
+      timeout: 3s
+      retries: 25
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 25
+  init:
+    <<: *backend
+    command: ["sh", "-ec", "alembic upgrade head && python -m candleflow.seed"]
+    depends_on:
+      db: { condition: service_healthy }
+  api:
+    <<: *backend
+    depends_on:
+      init: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:8000:8000"
+  marking:
+    <<: *backend
+    command: ["uvicorn", "candleflow.marking_mock:app", "--host", "0.0.0.0", "--port", "8001"]
+    depends_on:
+      init: { condition: service_completed_successfully }
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "candleflow.marking:celery", "worker", "--beat", "--concurrency=2", "--schedule=/tmp/candleflow-beat", "--loglevel=WARNING"]
+    depends_on:
+      init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      marking: { condition: service_started }
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres:

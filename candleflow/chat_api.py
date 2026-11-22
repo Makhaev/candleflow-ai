@@ -1,0 +1,113 @@
+import json
+from collections.abc import AsyncIterator
+from contextlib import aclosing
+from typing import Annotated
+
+from fastapi import APIRouter, File, Form, UploadFile
+from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import select
+
+from candleflow import assistant as ai
+from candleflow import inventory as inv
+from candleflow.api import DB, User, today
+from candleflow.auth import DomainError
+from candleflow.chat_models import Artifact, Conversation, Memory, Message
+from candleflow.privacy import Pseudonyms, sanitize_upload
+
+router = APIRouter(prefix="/api")
+
+
+@router.get("/conversations")
+def conversations(db: DB, user: User):
+    query = select(Conversation).where(Conversation.user_id == user.id).order_by(Conversation.id.desc())
+    return [inv.serialize(row) for row in db.scalars(query.limit(100))]
+
+
+@router.post("/conversations", status_code=201)
+def new_conversation(db: DB, user: User):
+    row = Conversation(user_id=user.id, title="Новый диалог")
+    db.add(row)
+    db.commit()
+    return inv.serialize(row)
+
+
+@router.get("/conversations/{key}")
+def get_conversation(key: int, db: DB, user: User):
+    row = ai.conversation(db, user.id, key)
+    messages = db.scalars(select(Message).where(Message.conversation_id == key).order_by(Message.id))
+    return {**inv.serialize(row), "messages": [ai.message_view(db, item) for item in messages]}
+
+
+@router.post("/conversations/{key}/stream")
+async def stream(
+    key: int,
+    db: DB,
+    user: User,
+    question: Annotated[str, Form(min_length=1, max_length=5000)],
+    upload: Annotated[UploadFile | None, File()] = None,
+):
+    ai.conversation(db, user.id, key)
+    question = question.strip()
+    if not question:
+        raise DomainError("Введите вопрос", 422)
+    attachment = None
+    if upload:
+        data = await upload.read(2_000_001)
+        await upload.close()
+        if len(data) > 2_000_000:
+            raise DomainError("Размер файла превышает 2 МБ", 413)
+        attachment = sanitize_upload(upload.filename or "", data, Pseudonyms(db))
+    pending = ai.start(db, user, key, question)
+    actor = user.id
+    db.commit()
+
+    async def events() -> AsyncIterator[bytes]:
+        async with aclosing(ai.generate(actor, key, pending, question, today(), attachment)) as iterator:
+            async for item in iterator:
+                yield ("data: " + json.dumps(item, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/messages/{key}/confirm")
+def confirm(key: int, db: DB, user: User):
+    result = ai.confirm(db, user, key)
+    db.commit()
+    return result
+
+
+@router.get("/memory")
+def memory(db: DB, user: User):
+    return [inv.serialize(row) for row in ai.preferences(db, user.id)]
+
+
+@router.delete("/memory/{key}", status_code=204)
+def delete_memory(key: int, db: DB, user: User):
+    row = db.scalar(select(Memory).where(Memory.id == key, Memory.user_id == user.id))
+    if row is None:
+        raise DomainError("Факт не найден", 404)
+    db.delete(row)
+    db.commit()
+    return Response(status_code=204)
+
+
+@router.get("/artifacts/{key}")
+def download(key: int, db: DB, user: User):
+    row = db.get(Artifact, key)
+    if row is None:
+        raise DomainError("Файл не найден", 404)
+    ai.message(db, user.id, row.message_id)
+    from urllib.parse import quote
+
+    return Response(
+        row.content,
+        media_type=row.mime,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(row.filename)}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
