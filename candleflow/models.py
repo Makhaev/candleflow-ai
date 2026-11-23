@@ -271,3 +271,9 @@ class MarkingReceipt(Base):
     __tablename__ = "marking_receipts"
     key: Mapped[str] = mapped_column(primary_key=True)
     payload: Mapped[dict] = mapped_column(JSONB)
+
+
+class DemoSeedRun(Base):
+    __tablename__ = "demo_seed_runs"
+    key: Mapped[str] = mapped_column(primary_key=True)
+    reference_day: Mapped[date]

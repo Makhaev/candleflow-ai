@@ -24,10 +24,15 @@ def postgres():
 
 
 @pytest.fixture
-def db(postgres):
+def empty_db(postgres):
     with SessionLocal.begin() as connection:
         names = ", ".join(Base.metadata.tables)
         connection.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
+
+
+@pytest.fixture
+def db(empty_db):
+    with SessionLocal.begin() as connection:
         for role, name in (("manager", "Орлова Елена"), ("storekeeper", "Петров Иван")):
             connection.add(
                 User(
