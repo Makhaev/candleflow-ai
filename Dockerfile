@@ -10,4 +10,4 @@ COPY prompts prompts
 COPY scripts scripts
 COPY evals evals
 COPY tests tests
-CMD ["uvicorn", "candleflow.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "candleflow.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

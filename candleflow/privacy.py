@@ -40,6 +40,8 @@ SAFE_HEADERS = {
 }
 NUMBER = re.compile(r"[+-]?\d{1,30}(?:[.,]\d{1,16})?")
 ISODATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+PHONE = re.compile(r"(?<!\w)(?:\+7|8)[ -]?\(?\d{3}\)?[ -]?\d{3}[ -]?\d{2}[ -]?\d{2}(?!\w)")
 
 
 class Pseudonyms:
@@ -77,6 +79,7 @@ class Pseudonyms:
     def mask(self, value: Any) -> Any:
         if isinstance(value, str):
             value = unicodedata.normalize("NFKC", value)
+            value = PHONE.sub("CONTACT_REDACTED", EMAIL.sub("CONTACT_REDACTED", value))
             matches: dict[tuple[int, int], set[str]] = {}
             for pattern, alias in self.rules:
                 for match in pattern.finditer(value):
@@ -130,6 +133,7 @@ def sanitize_rows(rows, aliases: Pseudonyms) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
     categories: dict[str, str] = {}
+    analytical_columns: set[int] = set()
     for index, row in enumerate(rows):
         if index >= 5001 or len(row) > 50:
             raise DomainError("Лимит файла: 5000 строк данных и 50 столбцов", 413)
@@ -140,8 +144,14 @@ def sanitize_rows(rows, aliases: Pseudonyms) -> bytes:
                 value = "0"
             masked = aliases.mask(value.strip())
             if index == 0:
-                cell = masked if masked.casefold() in SAFE_HEADERS else f"column_{column}"
-            elif isinstance(raw, (date, Decimal)) or NUMBER.fullmatch(masked) or ISODATE.fullmatch(masked):
+                if masked.casefold() in SAFE_HEADERS:
+                    analytical_columns.add(column)
+                    cell = masked
+                else:
+                    cell = f"column_{column}"
+            elif column in analytical_columns and (
+                isinstance(raw, (date, Decimal)) or NUMBER.fullmatch(masked) or ISODATE.fullmatch(masked)
+            ):
                 cell = masked.lstrip("+")
             elif not masked or masked in aliases.originals or masked in {"RUB", "EUR", "USD"}:
                 cell = masked

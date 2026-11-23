@@ -39,7 +39,7 @@ services:
       <<: *backend-env
       AI_PROVIDER: ${AI_PROVIDER:-fake}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      PRIMARY_MODEL: ${PRIMARY_MODEL:-gpt-5-mini}
+      PRIMARY_MODEL: ${PRIMARY_MODEL:-gpt-5.4-mini}
       FALLBACK_MODEL: ${FALLBACK_MODEL:-gpt-6-luna}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
     depends_on:

@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     marking_url: str = "http://localhost:8001"
     ai_provider: str = "fake"
     openai_api_key: str = ""
-    primary_model: str = "gpt-5-mini"
+    primary_model: str = "gpt-5.4-mini"
     fallback_model: str = "gpt-6-luna"
     llm_timeout: int = 45
 

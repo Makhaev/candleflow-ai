@@ -249,7 +249,10 @@ class FakeProvider:
                     "quantity": nums[0],
                     "planned_date": target,
                 }
-        if text.startswith("запомни"):
+        if re.match(r"^(?:запомни|сохрани)\b", text):
+            workshop = re.search(r"\bцех\s*(?:[:=—–-]\s*)?([^\n.!?]{1,160})", text)
+            if workshop and (value := workshop[1].strip()):
+                return "remember_preference", {"key": "workshop", "value": value}
             currency = next(
                 (
                     value

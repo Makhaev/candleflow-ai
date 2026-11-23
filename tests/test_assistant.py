@@ -100,6 +100,11 @@ def test_memory_isolation_and_deletion(db):
         assert '"value": "EUR"' not in ai.context(db, 2, w_key, DAY)[2][0]["content"]
         assert warehouse.delete(f"/api/memory/{facts[0]['id']}").status_code == 404
         assert manager.delete(f"/api/memory/{facts[0]['id']}").status_code == 204
+        workshop = ask(manager, m_key, "Запомни: мой цех — второй.")
+        assert workshop["proposal"]["args"] == {"key": "workshop", "value": "второй"}
+        assert manager.post(f"/api/messages/{workshop['id']}/confirm").json() == {"confirmed": True}
+        assert '"value": "второй"' in ai.context(db, 1, dialog(manager), DAY)[2][0]["content"]
+        assert '"value": "второй"' not in ai.context(db, 2, dialog(warehouse), DAY)[2][0]["content"]
 
 
 def test_interpreter_artifact_and_access(db):

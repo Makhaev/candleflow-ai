@@ -162,3 +162,39 @@ def test_provider_receives_aliases_and_ui_gets_restored_names(db, monkeypatch):
     assert "EMPLOYEE_2" in sent and "SUPPLIER_1" in sent
     assert all(name not in sent for name in ("Петрову", "Восковой двор", "Орлова Елена"))
     assert "ООО Восковой двор" in answer["body"] and "Орлова Елена" in answer["body"]
+
+
+def test_provider_does_not_receive_contact_details_or_numeric_identifiers(db, monkeypatch):
+    requests = []
+    attachments = []
+
+    class RecordingProvider(FakeProvider):
+        async def upload(self, filename, content):
+            attachments.append((filename, content.decode()))
+            return await super().upload(filename, content)
+
+        async def stream(self, model, instructions, items, tools, files):
+            requests.append(json.dumps(items, ensure_ascii=False))
+            async for event in super().stream(model, instructions, items, tools, files):
+                yield event
+
+    monkeypatch.setattr(ai, "FakeProvider", RecordingProvider)
+    with TestClient(app) as client:
+        sign_in(client, "manager")
+        answer = ask(
+            client,
+            dialog(client),
+            "Проанализируй таблицу. Контакты: ivan@example.org и +7 (911) 222-33-44.",
+            {"upload": ("private.csv", b"date,quantity,employee_id,phone\n2026-10-01,2,123456789012,79112223344",
+                        "text/csv")},
+        )
+    assert answer["status"] == "complete"
+    assert "CONTACT_REDACTED" in "\n".join(requests)
+    assert all(value not in "\n".join(requests) for value in ("ivan@example.org", "222-33-44"))
+    assert len(attachments) == 1
+    filename, content = attachments[0]
+    assert filename == "attachment.csv"
+    assert content.splitlines() == [
+        "date,quantity,column_3,column_4",
+        "2026-10-01,2,CATEGORY_1,CATEGORY_2",
+    ]
