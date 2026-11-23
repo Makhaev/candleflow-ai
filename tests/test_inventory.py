@@ -11,7 +11,7 @@ from candleflow import inventory as inv
 from candleflow.api import app
 from candleflow.auth import DomainError
 from candleflow.db import SessionLocal
-from candleflow.models import Allocation, Batch, Outbox, User
+from candleflow.models import Allocation, Batch, Outbox, StockMovement, User
 from candleflow.rates import exchange_rate
 from candleflow.schemas import Completion, JobInput, MaterialInput, ReceiptInput, RecipeInput
 
@@ -79,7 +79,22 @@ def test_parallel_reserves(db):
     assert all(result["status"] == "planned" for result in results)
     assert sorted(Decimal(r["components"][0]["missing"]) for r in results) == [0, 4]
     assert sum(Decimal(result["components"][0]["reserved"]) for result in results) == 6
-    assert db.get(Batch, 1).reserved == 6
+    batch = db.get(Batch, 1)
+    assert batch.quantity == batch.reserved == 6
+    full = next(result for result in results if result["components"][0]["signal"] == "green")
+    partial = next(result for result in results if result["components"][0]["signal"] == "yellow")
+    user = db.get(User, 1)
+    inv.job_transition(db, user, full["id"], "start")
+    db.commit()
+    with pytest.raises(DomainError, match="Не хватает"):
+        inv.job_transition(db, user, partial["id"], "start")
+    db.rollback()
+    with pytest.raises(DomainError, match="запланированное"):
+        inv.job_transition(db, user, full["id"], "start")
+    db.rollback()
+    assert (batch.quantity, batch.reserved) == (1, 1)
+    issues = db.scalars(select(StockMovement).where(StockMovement.kind == "issue")).all()
+    assert [(row.job_id, row.physical_delta) for row in issues] == [(full["id"], Decimal(-5))]
 
 
 @pytest.mark.parametrize(("actual", "remaining", "cost"), [("3", "4", "6"), ("6", "1", "10")])

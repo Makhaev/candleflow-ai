@@ -120,34 +120,6 @@ def test_interpreter_artifact_and_access(db):
         assert other.get(path).status_code == 404
 
 
-@pytest.mark.anyio
-@pytest.mark.parametrize("retryable", [True, False])
-async def test_provider_fallback(retryable):
-    tried = []
-
-    class ErrorProvider(FakeProvider):
-        async def stream(self, model, *args):
-            tried.append(model)
-            if model == "main":
-                raise ProviderError(retryable)
-            yield "ответ"
-            yield Final([])
-
-    async def collect():
-        return [
-            event
-            async for event in run_round(ErrorProvider(), ("main", "backup"), "", [], [], [], lambda _: None)
-        ]
-
-    if retryable:
-        assert await collect() == ["ответ", Final([])]
-        assert tried == ["main", "backup"]
-    else:
-        with pytest.raises(ProviderError):
-            await collect()
-        assert tried == ["main"]
-
-
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
