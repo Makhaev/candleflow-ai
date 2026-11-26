@@ -2,7 +2,7 @@ export type User = { id: number; name: string; role: 'storekeeper' | 'technologi
 export type Material = { code: string; name: string; unit: string }
 export type Recipe = { id: number; name: string }
 export type Batch = {
-  id: number; material_code: string; supplier: string; received_on: string;
+  id: number; receipt_id: number; material_code: string; supplier: string; received_on: string;
   status: string; received: string; quantity: string; reserved: string;
   unit_price: string; currency: string; unit_cost: string; exchange_rate: string; exchange_rate_on: string; comment: string;
 }
@@ -13,9 +13,11 @@ export type Component = {
 }
 export type Job = { id: number; recipe: string; quantity: string; planned_on: string; status: string; components: Component[] }
 export type Proposal = { job_id: number | null; expires: string; confirmed_at: string | null } & (
-  { action: 'plan_job'; recipe: string; args: { recipe_id: number; quantity: string; planned_on: string } } |
+  { action: 'plan_job'; recipe: string; args: { recipe_id: number; quantity: string; planned_on: string };
+    preview: PreviewComponent[] | null } |
   { action: 'remember_preference'; args: { key: 'currency' | 'workshop'; value: string } }
 )
+export type PreviewComponent = { code: string; name: string; unit: string; required: string; free: string; missing: string }
 export type ToolCall = { ordinal: number; name: string; model: string | null; status: string; at: string }
 export type Message = {
   id: number; role: 'user' | 'assistant'; body: string; status: string; model: string | null;
@@ -109,3 +111,20 @@ export function quantity(value: string) {
   const tail = fraction.replace(/0+$/, '')
   return whole.replace(/\B(?=(\d{3})+(?!\d))/g, '\u00a0') + (tail ? ',' + tail : '')
 }
+
+// Quantities arrive as decimal strings with up to six fractional digits; BigInt keeps the
+// subtraction exact instead of producing 0.19999999999999998.
+const scale = 6
+const toMicro = (value: string) => {
+  const [whole, fraction = ''] = value.split('.')
+  return BigInt(whole + (fraction + '0'.repeat(scale)).slice(0, scale))
+}
+
+export function subtract(left: string, right: string) {
+  const micro = toMicro(left) - toMicro(right)
+  const sign = micro < 0n ? '-' : ''
+  const digits = (micro < 0n ? -micro : micro).toString().padStart(scale + 1, '0')
+  return sign + digits.slice(0, -scale) + '.' + digits.slice(-scale)
+}
+
+export type Page<T> = { total: number; items: T[] }

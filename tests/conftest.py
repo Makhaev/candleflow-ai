@@ -11,6 +11,7 @@ if url := os.getenv("TEST_DATABASE_URL"):
     os.environ["DATABASE_URL"] = url
 os.environ["AI_PROVIDER"] = "fake"
 os.environ["OPENAI_API_KEY"] = ""
+os.environ["RATE_LIMITS"] = "false"
 
 from candleflow.auth import password_hash
 from candleflow.db import SessionLocal, engine

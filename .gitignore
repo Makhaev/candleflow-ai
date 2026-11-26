@@ -7,3 +7,10 @@ __pycache__/
 node_modules/
 dist/
 *.pyc
+*.egg-info/
+build/
+.DS_Store
+.idea/
+.vscode/
+# Task statement from the employer, not part of the solution
+Тестовое_задание_*.pdf

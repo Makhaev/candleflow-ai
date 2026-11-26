@@ -2,6 +2,7 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from typing import Annotated
+from urllib.parse import quote
 
 from anyio import CancelScope, create_memory_object_stream, create_task_group, to_thread
 from fastapi import APIRouter, File, Form, UploadFile
@@ -11,10 +12,12 @@ from sqlalchemy import select
 from candleflow import api_views as view
 from candleflow import assistant as ai
 from candleflow import inventory as inv
+from candleflow import memory
 from candleflow.api import DB, User, today
 from candleflow.auth import DomainError
 from candleflow.chat_models import Artifact, Conversation, Memory, Message
 from candleflow.privacy import Pseudonyms, sanitize_upload
+from candleflow.rate_limit import ASSISTANT, limiter
 
 router = APIRouter(prefix="/api", tags=["Ассистент"], responses=view.errors(401, 422, 503))
 
@@ -75,6 +78,7 @@ async def stream(
     question: Annotated[str, Form(min_length=1, max_length=5000)],
     upload: Annotated[UploadFile | None, File()] = None,
 ):
+    await limiter.check(ASSISTANT, str(user.id))
     await db.run_sync(ai.conversation, user.id, key)
     question = question.strip()
     if not question:
@@ -141,8 +145,8 @@ async def confirm(key: int, db: DB, user: User):
 
 
 @router.get("/memory", response_model=list[view.MemoryView], summary="Мои сохранённые предпочтения")
-async def memory(db: DB, user: User):
-    return [inv.serialize(row) for row in await db.run_sync(ai.preferences, user.id)]
+async def list_memory(db: DB, user: User):
+    return [inv.serialize(row) for row in await db.run_sync(memory.preferences, user.id)]
 
 
 @router.delete(
@@ -177,8 +181,6 @@ async def download(key: int, db: DB, user: User):
     if row is None:
         raise DomainError("Файл не найден", 404)
     await db.run_sync(ai.message, user.id, row.message_id)
-    from urllib.parse import quote
-
     return Response(
         row.content,
         media_type=row.mime,

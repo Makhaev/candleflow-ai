@@ -185,8 +185,13 @@ def test_provider_does_not_receive_contact_details_or_numeric_identifiers(db, mo
             client,
             dialog(client),
             "Проанализируй таблицу. Контакты: ivan@example.org и +7 (911) 222-33-44.",
-            {"upload": ("private.csv", b"date,quantity,employee_id,phone\n2026-10-01,2,123456789012,79112223344",
-                        "text/csv")},
+            {
+                "upload": (
+                    "private.csv",
+                    b"date,quantity,employee_id,phone\n2026-10-01,2,123456789012,79112223344",
+                    "text/csv",
+                )
+            },
         )
     assert answer["status"] == "complete"
     assert "CONTACT_REDACTED" in "\n".join(requests)

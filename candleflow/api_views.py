@@ -168,6 +168,11 @@ class JobView(BaseModel):
     components: list[JobRequirementView]
 
 
+class JobPage(BaseModel):
+    total: int
+    items: list[JobView]
+
+
 class CostView(BaseModel):
     job_id: int
     kind: Literal["reserved", "issued", "actual"]
@@ -208,11 +213,24 @@ class MemoryView(PreferenceView):
     user_id: int
 
 
+class PreviewComponentView(BaseModel):
+    code: str
+    name: str
+    unit: str
+    required: Decimal
+    free: Decimal = Field(description="Свободный остаток принятых партий на момент просмотра")
+    missing: Decimal
+
+
 class PendingActionView(BaseModel):
     message_id: int
     action: Literal["plan_job", "remember_preference"]
     args: JobInput | PreferenceView
     recipe: str
+    preview: list[PreviewComponentView] | None = Field(
+        default=None,
+        description="Что зарезервирует подтверждение сейчас. Только для неподтверждённого плана.",
+    )
     expires: datetime
     job_id: int | None
     confirmed_at: datetime | None

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, ApiError, day, label } from './api'
+import { api, ApiError, label } from './api'
 import type { Material, Recipe, User } from './api'
 import { AuditLog } from './audit'
 import { Warehouse, Production } from './inventory'
@@ -20,6 +20,7 @@ const demoAccounts: Record<User['role'], string> = {
   manager: 'manager', storekeeper: 'warehouse', technologist: 'technologist',
 }
 const demoPassword = 'demo-candleflow'
+const longDate = new Intl.DateTimeFormat('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' })
 
 function Brand() {
   return <div className="brand"><span className="brand-icon" aria-hidden="true">◈</span>
@@ -108,6 +109,7 @@ function Workspace({ user, onLogout, onSwitch }: { user: User; onLogout: () => v
     <a className="skip-link" href="#workspace-content">К основному содержанию</a>
     <aside className="sidebar">
       <Brand />
+      <p className="today"><time dateTime={user.today}>{longDate.format(new Date(user.today + 'T12:00:00'))}</time></p>
       <nav aria-label="Рабочие разделы">
         {nav.filter(item => item.id !== 'audit' || user.role === 'manager').map(item =>
           <button key={item.id} className={view === item.id ? 'active' : ''}
@@ -119,20 +121,18 @@ function Workspace({ user, onLogout, onSwitch }: { user: User; onLogout: () => v
       <div className="account-tools">
         <div className="account"><div className="avatar" aria-hidden="true">
           {user.name.split(' ').map(part => part[0]).join('').slice(0, 2)}
-        </div><div><strong>{user.name}</strong><small>{label[user.role]}</small></div></div>
-        <div className="account-actions">
-          <label><span className="sr-only">Переключить демо-роль</span>
-            <select value={user.role} onChange={event => void switchAccount(event.target.value as User['role'])} disabled={accountBusy}>
-              {Object.keys(demoAccounts).map(role => <option key={role} value={role}>{label[role]}</option>)}
-            </select>
-          </label>
+        </div><div className="account-name"><strong>{user.name}</strong><small>{label[user.role]}</small></div>
           <button className="logout" disabled={accountBusy} onClick={logout}>Выйти</button>
         </div>
+        <label className="role-switch"><span>Демо: войти как</span>
+          <select value={user.role} onChange={event => void switchAccount(event.target.value as User['role'])} disabled={accountBusy}>
+            {Object.keys(demoAccounts).map(role => <option key={role} value={role}>{label[role]}</option>)}
+          </select>
+        </label>
         <ErrorNote error={accountError} />
       </div>
     </aside>
     <main className="workspace-main" id="workspace-content" tabIndex={-1}>
-      <div className="topline"><time dateTime={user.today}>{day(user.today)}</time></div>
       <ErrorNote error={error} />
       {view === 'batches' && <Warehouse user={user} materials={materials} reloadCatalog={reloadCatalog} />}
       {view === 'jobs' && <Production user={user} initialJob={selectedJob} materials={materials} recipes={recipes}

@@ -207,6 +207,7 @@ async def evaluate(dsn: str, day: date, cases: list[dict], fake: bool, judge_mod
     from candleflow.db import SessionLocal
     from candleflow.main import app
     from candleflow.privacy import Pseudonyms
+    from candleflow.rate_limit import limiter
     from candleflow.seed import DEMO_PASSWORD, seed
     from scripts.eval_checks import Check, exact_values, tool_check
 
@@ -221,6 +222,8 @@ async def evaluate(dsn: str, day: date, cases: list[dict], fake: bool, judge_mod
                 patch.object(settings, "ai_provider", "fake" if fake else "openai"),
                 patch.object(api, "today", lambda: day),
                 patch.object(chat_api, "today", lambda: day),
+                # A manual run may be repeated within a minute; limits protect users, not the eval.
+                patch.object(limiter, "enabled", False),
             ):
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app),

@@ -355,6 +355,42 @@ def recipe_for_plan(db: Session, user: User, data: JobInput) -> Recipe:
     return get_or_fail(db, Recipe, data.recipe_id)
 
 
+def requirement_preview(db: Session, recipe_id: int, quantity: Decimal) -> list[dict]:
+    """Read-only forecast of what planning would reserve now: need, free stock and expected shortage."""
+    free = (
+        select(Batch.material_code, func.sum(Batch.quantity - Batch.reserved).label("free"))
+        .where(Batch.status == "accepted")
+        .group_by(Batch.material_code)
+        .subquery()
+    )
+    rows = db.execute(
+        select(Ingredient.per_unit, Material, func.coalesce(free.c.free, 0))
+        .join(Material, Material.code == Ingredient.material_code)
+        .outerjoin(free, free.c.material_code == Ingredient.material_code)
+        .where(Ingredient.recipe_id == recipe_id)
+        .order_by(Material.code)
+    )
+    preview = []
+    for per_unit, material, available in rows:
+        required = per_unit * quantity
+        preview.append(
+            {
+                "code": material.code,
+                "name": material.name,
+                "unit": material.unit,
+                "required": str(required),
+                "free": str(available),
+                "missing": str(max(ZERO, required - available)),
+            }
+        )
+    return preview
+
+
+def plan_preview(db: Session, user: User, data: JobInput) -> dict:
+    recipe = recipe_for_plan(db, user, data)
+    return {"recipe": recipe.name, "components": requirement_preview(db, recipe.id, data.quantity)}
+
+
 def create_draft(db: Session, user: User, data: JobInput) -> dict:
     recipe = recipe_for_plan(db, user, data)
     ingredients = db.scalars(
@@ -417,41 +453,72 @@ def allocations(db: Session, job_id: int) -> list[tuple[Allocation, Batch]]:
     return [(allocation, batch) for allocation, batch in rows]
 
 
-def job_detail(db: Session, user: User, job_id: int) -> dict:
+def job_details(db: Session, user: User, job_ids: list[int]) -> list[dict]:
+    """Load cards for many jobs in three queries, whatever the list size, keeping the input order."""
     require(user, *READERS)
-    job = get_or_fail(db, Job, job_id)
-    recipe = get_or_fail(db, Recipe, job.recipe_id)
-    held: dict[str, Decimal] = defaultdict(Decimal)
-    issued: dict[str, Decimal] = defaultdict(Decimal)
-    used: dict[str, Decimal] = defaultdict(Decimal)
-    for allocation, batch in allocations(db, job_id):
-        held[batch.material_code] += allocation.reserved
-        issued[batch.material_code] += allocation.issued
-        used[batch.material_code] += allocation.consumed
-    components = []
+    if not job_ids:
+        return []
+    jobs = {
+        job.id: (job, name)
+        for job, name in db.execute(
+            select(Job, Recipe.name).join(Recipe, Recipe.id == Job.recipe_id).where(Job.id.in_(job_ids))
+        )
+    }
+    totals: dict[tuple[int, str], dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    for allocation, code in db.execute(
+        select(Allocation, Batch.material_code).join(Batch).where(Allocation.job_id.in_(job_ids))
+    ):
+        amounts = totals[allocation.job_id, code]
+        amounts["reserved"] += allocation.reserved
+        amounts["issued"] += allocation.issued
+        amounts["consumed"] += allocation.consumed
+    components: dict[int, list[dict]] = defaultdict(list)
     rows = db.execute(
-        select(Component, Material).join(Material).where(Component.job_id == job_id).order_by(Material.code)
+        select(Component, Material)
+        .join(Material)
+        .where(Component.job_id.in_(job_ids))
+        .order_by(Component.job_id, Material.code)
     )
     for component, material in rows:
-        code = material.code
-        reserved = held[code]
-        signal = "green" if reserved == component.required else "yellow" if reserved else "red"
-        components.append(
+        job = jobs[component.job_id][0]
+        amounts = totals[job.id, material.code]
+        reserved, issued = amounts["reserved"], amounts["issued"]
+        # Issued material still covers the requirement after start, so a running job stays green.
+        covered = reserved + issued
+        missing = max(ZERO, component.required - covered) if job.status in {"draft", "planned"} else ZERO
+        components[job.id].append(
             {
-                "code": code,
+                "code": material.code,
                 "name": material.name,
                 "unit": material.unit,
                 "required": str(component.required),
                 "reserved": str(reserved),
-                "issued": str(issued[code]),
-                "consumed": str(used[code]),
-                "missing": str(max(ZERO, component.required - reserved - issued[code]))
-                if job.status in {"draft", "planned"}
-                else str(ZERO),
-                "signal": signal,
+                "issued": str(issued),
+                "consumed": str(amounts["consumed"]),
+                "missing": str(missing),
+                "signal": "green" if covered >= component.required else "yellow" if covered else "red",
             }
         )
-    return {**serialize(job), "recipe": recipe.name, "components": components}
+    return [
+        {**serialize(jobs[key][0]), "recipe": jobs[key][1], "components": components[key]}
+        for key in job_ids
+        if key in jobs
+    ]
+
+
+def job_detail(db: Session, user: User, job_id: int) -> dict:
+    found = job_details(db, user, [job_id])
+    if not found:
+        raise DomainError("Запись не найдена", 404)
+    return found[0]
+
+
+def job_list(db: Session, user: User, offset: int, limit: int, status: str | None = None) -> dict:
+    require(user, *READERS)
+    query = select(Job.id).where(Job.status == status) if status else select(Job.id)
+    total = db.scalar(select(func.count()).select_from(query.subquery()))
+    keys = list(db.scalars(query.order_by(Job.id.desc()).offset(offset).limit(limit)))
+    return {"total": total, "items": job_details(db, user, keys)}
 
 
 def job_transition(db: Session, user: User, job_id: int, action: Literal["start", "cancel"]) -> dict:
@@ -576,7 +643,7 @@ def shortages(db: Session, user: User, period: Period) -> list[dict]:
         .where(Job.status == "planned", Job.planned_on.between(period.start, period.end))
         .order_by(Job.planned_on, Job.id)
     )
-    details = (job_detail(db, user, job_id) for job_id in jobs)
+    details = job_details(db, user, list(jobs))
     return [job for job in details if any(Decimal(c["missing"]) for c in job["components"])]
 
 

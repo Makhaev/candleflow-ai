@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api, day, label, quantity, stream } from './api'
-import type { Conversation, Fact, Job, Message, StreamEvent } from './api'
-import { ErrorNote, errorText } from './common'
+import type { Conversation, Fact, Job, Message, PreviewComponent, StreamEvent } from './api'
+import { ErrorNote, errorText, PageHead } from './common'
 
 const executionStatus: Record<string, string> = {
   complete: 'Выполнен', completed: 'Выполнен', interrupted: 'Прерван',
@@ -15,6 +15,25 @@ const examples = [
   'Запланируй 20 свечей Лаванда на пятницу',
   'Построй график расхода соевого воска по неделям',
 ]
+
+function PlanPreview({ rows }: { rows: PreviewComponent[] }) {
+  const short = rows.filter(row => Number(row.missing) > 0)
+  return <>
+    <div className="table-wrap"><table className="preview-table">
+      <caption className="sr-only">Что будет зарезервировано</caption>
+      <thead><tr><th>Материал</th><th>Нужно</th><th>Свободно</th><th>Не хватит</th></tr></thead>
+      <tbody>{rows.map(row => <tr key={row.code} className={Number(row.missing) > 0 ? 'short' : undefined}>
+        <td>{row.name}</td>
+        {[row.required, row.free, row.missing].map((value, index) =>
+          <td key={index}>{Number(value) || index < 2 ? quantity(value) + ' ' + row.unit : '—'}</td>)}
+      </tr>)}</tbody>
+    </table></div>
+    <p className={short.length ? 'preview-note warn' : 'preview-note'}>
+      {short.length ? 'Резерв будет частичным: запустить задание можно будет только после поступления недостающего сырья.'
+        : 'Всё сырьё есть в свободном остатке, задание получит полный резерв.'}
+    </p>
+  </>
+}
 
 function Answer({ answer, confirm, goToJob, busy }: { answer: Message; confirm: (id: number) => void;
   goToJob: (id: number) => void; busy: boolean }) {
@@ -34,7 +53,8 @@ function Answer({ answer, confirm, goToJob, busy }: { answer: Message; confirm: 
       {proposal && <section className="proposal">
         <h3>{proposal.action === 'plan_job' ? 'Планирование задания' : 'Сохранение предпочтения'}</h3>
         {proposal.action === 'plan_job'
-          ? <p>{proposal.recipe} · {quantity(proposal.args.quantity)} шт · {day(proposal.args.planned_on)}</p>
+          ? <><p>{proposal.recipe} · {quantity(proposal.args.quantity)} шт · {day(proposal.args.planned_on)}</p>
+            {!proposal.job_id && proposal.preview && <PlanPreview rows={proposal.preview} />}</>
           : <p>{proposal.args.key === 'currency' ? 'Валюта' : 'Цех'} · {proposal.args.value}</p>}
         {proposal.job_id ? <button className="secondary" onClick={() => goToJob(proposal.job_id!)}>
           Открыть задание #{proposal.job_id}
@@ -49,8 +69,7 @@ function Answer({ answer, confirm, goToJob, busy }: { answer: Message; confirm: 
       </div>)}
       {(answer.model || answer.tools.length > 0) && <div className="answer-meta">
         {answer.model && <span title={answer.model}>{answer.model === 'demo' ? 'Демо-модель' : answer.model}</span>}
-        {answer.status === 'streaming' && answer.tools.map((name, index) =>
-          <span key={name + index}>{label[name] ?? name}</span>)}
+        {[...new Set(answer.tools)].map(name => <span key={name}>{label[name] ?? name}</span>)}
       </div>}
       {answer.tool_calls.length > 0 && <details className="tool-log">
         <summary>Вызовы инструментов · {answer.tool_calls.length}</summary>
@@ -215,13 +234,12 @@ export function Chat({ goToJob }: { goToJob: (id: number) => void }) {
   }
 
   return <>
-    <header className="page-head"><div><h1>Ассистент мастерской</h1>
-      <p>Остатки, дефициты, себестоимость и планирование</p></div>
+    <PageHead title="Ассистент" description="Спросите про остатки, дефициты и себестоимость или попросите запланировать задание. Изменения выполняются только после вашего подтверждения.">
       <button className="secondary" onClick={toggleMemory} aria-expanded={memory}>
-        {memory ? 'Скрыть память' : 'Память'}
+        {memory ? 'Скрыть память' : 'Память ассистента'}
       </button>
-    </header>
-    {memory && <section className="drawer"><h2>Мои предпочтения</h2>
+    </PageHead>
+    {memory && <section className="panel memory-panel"><h2>Что ассистент помнит о вас</h2>
       <p className="muted">Скажите ассистенту, что запомнить, например «Запомни, считать в евро».</p>
       {loadingFacts ? <p className="muted" role="status">Загружаем предпочтения…</p>
         : facts.length ? <ul className="memory-list">{facts.map(fact => <li key={fact.id}>

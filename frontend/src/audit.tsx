@@ -1,8 +1,9 @@
 import { Fragment, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import { api, dateTime, label } from './api'
+import { api, dateTime } from './api'
 import type { Audit } from './api'
-import { ErrorNote, errorText } from './common'
+import { ErrorNote, errorText, PageHead } from './common'
+import { changes, summary } from './format'
 
 const entities = {
   batches: 'Партия',
@@ -12,34 +13,18 @@ const entities = {
   recipes: 'Рецепт',
 }
 
-const fieldNames: Record<string, string> = {
-  actor_id: 'Инициатор', code: 'Код', comment: 'Комментарий', completed_on: 'Дата завершения',
-  currency: 'Валюта', exchange_rate: 'Курс', exchange_rate_on: 'Дата курса', exchange_rate_id: 'Котировка',
-  id: 'Номер', material_code: 'Материал', name: 'Название', planned_on: 'Дата плана',
-  quantity: 'Количество', received: 'Поступило', received_on: 'Дата поступления', receipt_id: 'Поступление',
-  recipe_id: 'Рецепт', reserved: 'В резерве', status: 'Статус', supplier: 'Поставщик', supplier_id: 'Поставщик',
-  unit: 'Единица измерения', unit_cost: 'Себестоимость за ед.', unit_price: 'Цена за ед.', created_by: 'Создал',
-}
-
 type Filters = { entity: string; actor: string; date_from: string; date_to: string }
 const initialFilters: Filters = { entity: '', actor: '', date_from: '', date_to: '' }
 const limit = 15
 
-function display(value: unknown) {
-  if (value === undefined || value === null || value === '') return '—'
-  if (typeof value === 'string') return label[value] ?? value
-  return JSON.stringify(value)
-}
-
 function AuditChanges({ row }: { row: Audit }) {
-  const keys = [...new Set([...Object.keys(row.before ?? {}), ...Object.keys(row.after)])]
-    .filter(key => JSON.stringify(row.before?.[key]) !== JSON.stringify(row.after[key]))
-  if (!keys.length) return <p className="muted">Значения полей совпадают.</p>
+  const list = changes(row)
+  if (!list.length) return <p className="muted">Значения полей совпадают.</p>
   return <dl className="audit-diff">
-    {keys.map(key => <div key={key}>
-      <dt>{fieldNames[key] ?? key}</dt>
-      <dd><span>Было</span>{display(row.before?.[key])}</dd>
-      <dd><span>Стало</span>{display(row.after[key])}</dd>
+    {list.map(item => <div key={item.key}>
+      <dt>{item.field}</dt>
+      {row.before && <dd><span>Было</span>{item.from}</dd>}
+      <dd><span>{row.before ? 'Стало' : 'Значение'}</span>{item.to}</dd>
     </div>)}
   </dl>
 }
@@ -85,7 +70,7 @@ export function AuditLog({ goToBatch, goToJob }: { goToBatch: (id: number) => vo
   }
 
   return <>
-    <header className="page-head"><div><h1>Журнал аудита</h1><p>Изменения по партиям, поступлениям и производству</p></div></header>
+    <PageHead title="Журнал аудита" description="Кто, когда и что изменил в партиях, поступлениях, заданиях и справочниках" />
     <section className="panel audit-panel" aria-label="Журнал изменений" aria-busy={busy}>
       <form className="audit-controls" onSubmit={apply}>
         <div className="form-row">
@@ -113,7 +98,7 @@ export function AuditLog({ goToBatch, goToJob }: { goToBatch: (id: number) => vo
           <div className="table-wrap audit-scroll" tabIndex={0} aria-label="Таблица аудита">
             <table className="audit-table">
               <thead><tr><th scope="col">Время (МСК)</th><th scope="col">Сотрудник</th><th scope="col">Объект</th>
-                <th scope="col">Действие</th><th scope="col">Подробности</th></tr></thead>
+                <th scope="col">Что изменилось</th><th scope="col"><span className="sr-only">Подробности</span></th></tr></thead>
               <tbody>{rows.map(row => {
                 const entity = entities[row.entity as keyof typeof entities] ?? row.entity
                 const isExpanded = expanded === row.id
@@ -126,9 +111,9 @@ export function AuditLog({ goToBatch, goToJob }: { goToBatch: (id: number) => vo
                     <td>{row.actor}</td>
                     <td>{target ? <button className="link" onClick={() => target(id)}>{entity} #{row.entity_id}</button>
                       : <>{entity} · {row.entity_id}</>}</td>
-                    <td>{row.before ? 'Изменение' : 'Создание'}</td>
-                    <td><button className="secondary compact" aria-expanded={isExpanded}
-                      onClick={() => setExpanded(isExpanded ? null : row.id)}>{isExpanded ? 'Скрыть' : 'Показать'}</button></td>
+                    <td className="audit-summary">{summary(row)}</td>
+                    <td><button className="ghost" aria-expanded={isExpanded}
+                      onClick={() => setExpanded(isExpanded ? null : row.id)}>{isExpanded ? 'Свернуть' : 'Все поля'}</button></td>
                   </tr>
                   {isExpanded && <tr className="audit-expanded"><td colSpan={5}><AuditChanges row={row} /></td></tr>}
                 </Fragment>

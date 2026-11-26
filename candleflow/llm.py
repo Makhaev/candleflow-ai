@@ -4,6 +4,7 @@ import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import Protocol
 
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
@@ -103,6 +104,11 @@ class OpenAIProvider:
         await self.client.close()
 
 
+def human(value: str) -> str:
+    """59.600000 -> 59,6: how a person writes a quantity in Russian."""
+    return format(Decimal(value).normalize(), "f").replace(".", ",")
+
+
 class FakeProvider:
     """Deterministic offline demo with the same tool dispatch and permission checks."""
 
@@ -133,27 +139,39 @@ class FakeProvider:
             if "error" in result:
                 answer = result["error"]
             elif "proposal" in result:
-                answer = "Подготовлено предложение. Проверьте параметры и подтвердите планирование."
+                proposal = result["proposal"]
+                gaps = [
+                    f"{row['name']} — {human(row['missing'])} {row['unit']}"
+                    for row in proposal["components"]
+                    if Decimal(row["missing"])
+                ]
+                answer = (
+                    f"Подготовлено предложение: {proposal['recipe']}, {proposal['quantity']} шт "
+                    f"на {date.fromisoformat(proposal['planned_on']):%d.%m.%Y}. Проверьте параметры и подтвердите планирование."
+                )
+                if gaps:
+                    answer += " Резерв будет частичным, не хватит: " + "; ".join(gaps) + "."
             elif "pending_preference" in result:
                 answer = "Подготовлено предпочтение. Нажмите «Подтвердить», чтобы сохранить его."
             elif "dataset" in result and files:
                 answer, output = self.interpreter()
             elif "total" in result:
                 answer = (
-                    f"{result['name']}: общий остаток {result['physical']} {result['unit']}, "
-                    f"свободно {result['free']} {result['unit']}, в резерве {result['reserved']} {result['unit']}."
+                    f"{result['name']}: общий остаток {human(result['physical'])} {result['unit']}, "
+                    f"свободно {human(result['free'])} {result['unit']}, "
+                    f"в резерве {human(result['reserved'])} {result['unit']}."
                 )
             elif "total_rub" in result:
-                answer = f"Себестоимость задания: {result['total_rub']} RUB."
+                answer = f"Себестоимость задания: {human(result['total_rub'])} RUB."
                 if "converted" in result:
-                    answer += f" В выбранной валюте: {result['converted']} {result['currency']}."
+                    answer += f" В выбранной валюте: {human(result['converted'])} {result['currency']}."
             elif "history" in result:
                 batch = result["batch"]
                 actors = ", ".join(dict.fromkeys(row["actor"] for row in result["history"]))
                 answer = f"Поставщик партии — {batch['supplier']}. Изменения внесли: {actors}."
             elif result.get("jobs"):
                 answer = "\n".join(
-                    f"Задание {job['id']} · {component['name']} — {component['missing']} {component['unit']}"
+                    f"Задание {job['id']} · {component['name']} — {human(component['missing'])} {component['unit']}"
                     for job in result["jobs"]
                     for component in job["components"]
                     if component["signal"] != "green"
@@ -235,7 +253,7 @@ class FakeProvider:
             "короб": "BOX",
         }
         code = next((code for word, code in codes.items() if word in text or code.lower() in text), None)
-        if text.startswith("запланируй") and nums:
+        if re.search(r"(?<!\w)(?:за|с)планир", text) and nums:
             recipes = context["recipes"]
             recipe = next((row for row in recipes if row["name"].casefold() in text), None)
             if recipe:
@@ -249,7 +267,7 @@ class FakeProvider:
                     "quantity": nums[0],
                     "planned_date": target,
                 }
-        if re.match(r"^(?:запомни|сохрани)\b", text):
+        if re.search(r"(?<!\w)(?:запомн|сохран)", text):
             workshop = re.search(r"\bцех\s*(?:[:=—–-]\s*)?([^\n.!?]{1,160})", text)
             if workshop and (value := workshop[1].strip()):
                 return "remember_preference", {"key": "workshop", "value": value}

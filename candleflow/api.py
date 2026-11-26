@@ -1,10 +1,12 @@
+import logging
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import APIRouter, Cookie, Depends, FastAPI, Query, Response
+from anyio import to_thread
+from fastapi import APIRouter, Cookie, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyCookie
@@ -14,10 +16,14 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from candleflow import api_views as view
+from candleflow import auth
 from candleflow import inventory as inv
-from candleflow.auth import DomainError, authenticate, login, token_hash
+from candleflow.auth import DomainError, authenticate, token_hash
+from candleflow.config import settings
 from candleflow.db import AsyncSessionLocal
-from candleflow.models import Job, LoginSession, Material, Recipe
+from candleflow.models import LoginSession, Material, Recipe
+from candleflow.observability import RequestContextMiddleware, configure_logging, request_id
+from candleflow.rate_limit import LOGIN, RateLimited, limiter
 from candleflow.rates import fetch_quote
 from candleflow.schemas import (
     Code,
@@ -31,7 +37,10 @@ from candleflow.schemas import (
     RecipeInput,
 )
 
+configure_logging(settings.log_level)
+logger = logging.getLogger(__name__)
 app = FastAPI(title="CandleFlow")
+app.add_middleware(RequestContextMiddleware)
 router = APIRouter(prefix="/api", tags=["Учёт"], responses=view.errors(422, 503))
 COOKIE = "candleflow_session"
 WORKSHOP_TIME = ZoneInfo("Europe/Moscow")
@@ -67,7 +76,8 @@ User = Annotated[inv.User, Depends(current_user)]
 
 @app.exception_handler(DomainError)
 async def domain_error(_, exc: DomainError):
-    return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+    headers = {"Retry-After": str(exc.retry_after)} if isinstance(exc, RateLimited) else None
+    return JSONResponse({"detail": str(exc)}, status_code=exc.status, headers=headers)
 
 
 @app.exception_handler(RequestValidationError)
@@ -83,7 +93,21 @@ async def integrity_error(_, exc):
 
 @app.exception_handler(OperationalError)
 async def operational_error(_, exc):
+    logger.error("database unavailable: %s", type(exc).__name__)
     return JSONResponse({"detail": "База данных временно недоступна"}, status_code=503)
+
+
+@app.exception_handler(Exception)
+async def unexpected_error(_, exc: Exception):
+    # The traceback goes to the log; the user gets a readable message and an ID to report.
+    logger.exception("unhandled error")
+    return JSONResponse(
+        {
+            "detail": f"Не удалось выполнить запрос. Повторите попытку, а если ошибка останется, "
+            f"сообщите код {request_id.get()[:8]}."
+        },
+        status_code=500,
+    )
 
 
 def public_user(user: inv.User) -> dict:
@@ -95,11 +119,17 @@ def public_user(user: inv.User) -> dict:
 )
 async def sign_in(
     data: Login,
+    request: Request,
     response: Response,
     db: DB,
     current_token: Annotated[str | None, Cookie(alias=COOKIE)] = None,
 ):
-    user, token = await db.run_sync(login, data.login, data.password)
+    client = request.client.host if request.client else "unknown"
+    await limiter.check(LOGIN, f"{data.login.casefold()}:{client}")
+    user = await db.run_sync(auth.find_user, data.login)
+    if not await to_thread.run_sync(auth.verify_password, user, data.password):
+        raise DomainError("Неверный логин или пароль", 401)
+    token = await db.run_sync(auth.open_session, user)
     if current_token:
         previous = await db.get(LoginSession, token_hash(current_token))
         if previous:
@@ -293,14 +323,18 @@ async def stock(material_code: Code, db: DB, user: User):
 
 @router.get(
     "/jobs",
-    response_model=list[view.JobView],
+    response_model=view.JobPage,
     responses=view.errors(401, 403),
     summary="Список производственных заданий",
 )
-async def jobs(db: DB, user: User, offset: Annotated[int, Query(ge=0)] = 0):
-    inv.require(user, *inv.READERS)
-    keys = await db.scalars(select(Job.id).order_by(Job.id.desc()).offset(offset).limit(50))
-    return await db.run_sync(lambda sync: [inv.job_detail(sync, user, key) for key in keys])
+async def jobs(
+    db: DB,
+    user: User,
+    status: view.JobStatus | None = None,
+    offset: PageOffset = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+):
+    return await db.run_sync(inv.job_list, user, offset, limit, status)
 
 
 @router.get(

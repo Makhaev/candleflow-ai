@@ -1,88 +1,35 @@
 import asyncio
-import csv
-import io
 import json
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
-from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Literal
 
 from anyio import CancelScope, move_on_after
 from openai import OpenAIError
-from pydantic import Field, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from candleflow import inventory as inv
+from candleflow import memory
+from candleflow import tools as registry
 from candleflow.auth import DomainError
-from candleflow.chat_models import Artifact, Conversation, Memory, Message, PendingAction, ToolExecution
+from candleflow.chat_models import Artifact, Conversation, Message, PendingAction, ToolExecution
 from candleflow.config import settings
 from candleflow.db import AsyncSessionLocal
-from candleflow.grounding import interpreter_numbers, numbers
+from candleflow.grounding import interpreter_numbers, numbers, supported
 from candleflow.llm import FakeProvider, Final, OpenAIProvider, Provider, ProviderError, Restart, run_round
 from candleflow.models import Recipe, User
 from candleflow.privacy import Pseudonyms
-from candleflow.rates import mock_quote
-from candleflow.schemas import Code, Input, JobInput, Period, Pieces, Text
+from candleflow.schemas import JobInput
 
 PROMPT = (Path(__file__).resolve().parent.parent / "prompts" / "assistant.md").read_text(encoding="utf-8")
 MIMES = {
     "png": "image/png",
     "csv": "text/csv",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-}
-
-
-class StockArgs(Input):
-    material_code: Code
-
-
-class HistoryArgs(Input):
-    batch_id: Annotated[int, Field(gt=0)]
-
-
-class CostArgs(Input):
-    job_id: Annotated[int, Field(gt=0)]
-
-
-class ShortageArgs(Input):
-    date_from: date
-    date_to: date
-
-
-class JobPlanArgs(Input):
-    recipe_id: Annotated[int, Field(gt=0)]
-    quantity: Pieces
-    planned_date: date
-
-
-class ConsumptionArgs(Period):
-    material_code: Code
-
-
-class Preference(Input):
-    key: Literal["currency", "workshop"]
-    value: Text
-
-
-TOOLS = {
-    "get_material_stock": (
-        StockArgs,
-        "Физический остаток по всем партиям, резерв и свободный остаток по принятым партиям.",
-    ),
-    "get_production_shortages": (ShortageArgs, "Дефициты производственных заданий за период включительно."),
-    "get_batch_history": (HistoryArgs, "История партии по её номеру."),
-    "calculate_job_cost": (CostArgs, "Зарезервированная или фактическая себестоимость задания в рублях."),
-    "create_and_plan_job": (JobPlanArgs, "Подготовить предложение запланировать задание."),
-    "consumption_dataset": (ConsumptionArgs, "Подготовить CSV расхода материала по датам для расчёта."),
-    "job_cost_dataset": (CostArgs, "Подготовить CSV себестоимости по компонентам для сценарного расчёта."),
-    "remember_preference": (
-        Preference,
-        "Предложить сохранить явно указанное пользователем предпочтение после подтверждения.",
-    ),
 }
 
 
@@ -117,8 +64,18 @@ def message_view(db: Session, row: Message) -> dict:
         "files": [dict(file._mapping) for file in files],
         "tools": [item.name for item in executions],
         "tool_calls": [inv.serialize(item) for item in executions],
-        "proposal": inv.serialize(proposal) if proposal else None,
+        "proposal": proposal_view(db, proposal) if proposal else None,
     }
+
+
+def proposal_view(db: Session, proposal: PendingAction) -> dict:
+    result = inv.serialize(proposal)
+    result["preview"] = None
+    if proposal.action == "plan_job" and proposal.job_id is None:
+        # Recomputed on every view, so the card shows what confirming *now* would reserve.
+        args = JobInput.model_validate(proposal.args)
+        result["preview"] = inv.requirement_preview(db, args.recipe_id, args.quantity)
+    return result
 
 
 def start(db: Session, user: User, key: int, question: str) -> int:
@@ -158,7 +115,7 @@ def confirm(db: Session, user: User, message_id: int) -> dict:
     if proposal.expires <= now:
         raise DomainError("Срок подтверждения истёк. Подготовьте новое предложение.")
     if proposal.action == "remember_preference":
-        save_preference(db, user, Preference.model_validate(proposal.args))
+        memory.save_preference(db, user, memory.Preference.model_validate(proposal.args))
         proposal.confirmed_at = now
         return {"confirmed": True}
     job = inv.plan(db, user, JobInput.model_validate(proposal.args))
@@ -167,115 +124,9 @@ def confirm(db: Session, user: User, message_id: int) -> dict:
     return job
 
 
-def preferences(db: Session, user_id: int) -> list[Memory]:
-    return list(db.scalars(select(Memory).where(Memory.user_id == user_id).order_by(Memory.id)))
-
-
-def save_preference(db: Session, user: User, data: Preference) -> dict:
-    if data.key == "currency" and data.value not in {"RUB", "EUR", "USD"}:
-        raise DomainError("Валюта должна быть RUB, EUR или USD", 422)
-    statement = insert(Memory).values(user_id=user.id, key=data.key, value=data.value)
-    db.execute(
-        statement.on_conflict_do_update(
-            index_elements=[Memory.user_id, Memory.key], set_={"value": statement.excluded.value}
-        )
-    )
-    return {"preference": data.model_dump()}
-
-
-def csv_bytes(headers: list[str], rows: list) -> bytes:
-    stream = io.StringIO()
-    writer = csv.writer(stream)
-    writer.writerow(headers)
-    writer.writerows(rows)
-    return stream.getvalue().encode("utf-8")
-
-
-def invoke(
-    db: Session, user: User, message_id: int, question: str, name: str, arguments: str, today: date
-) -> tuple[dict, bytes | None]:
-    if name not in TOOLS:
-        raise DomainError("Инструмент недоступен", 422)
-    inv.require(user, *inv.READERS)
-    data = TOOLS[name][0].model_validate_json(arguments)
-    if name == "get_material_stock":
-        return inv.stock(db, user, data.material_code), None
-    if name == "get_production_shortages":
-        period = Period(start=data.date_from, end=data.date_to)
-        return {"jobs": inv.shortages(db, user, period)[:50]}, None
-    if name == "get_batch_history":
-        result = inv.batch_history(db, user, data.batch_id)
-        result["history"] = result["history"][-50:]
-        return result, None
-    if name in {"calculate_job_cost", "job_cost_dataset"}:
-        result = inv.job_cost(db, user, data.job_id)
-        if name == "calculate_job_cost":
-            currency = next((row.value for row in preferences(db, user.id) if row.key == "currency"), "RUB")
-            if currency != "RUB":
-                quote = mock_quote(currency, today)
-                result["currency"] = currency
-                with localcontext() as arithmetic:
-                    arithmetic.prec = 64
-                    result["converted"] = str(
-                        (Decimal(result["total_rub"]) / quote.rate).quantize(
-                            Decimal("0.01"), rounding=ROUND_HALF_EVEN
-                        )
-                    )
-                result["rate_on"] = str(quote.day)
-            return result, None
-        rows = list(result["components_rub"].items())
-        if not rows:
-            raise DomainError("Для этого задания отсутствуют данные о затратах", 422)
-        return {"dataset": "job_cost.csv", "rows": len(rows)}, csv_bytes(["material", "cost_rub"], rows)
-    if name == "consumption_dataset":
-        rows = inv.consumption(db, user, data, data.material_code)
-        if not rows:
-            raise DomainError("За указанный период нет данных о расходе этого материала", 422)
-        payload = csv_bytes(["date", "quantity"], [(row["date"], row["quantity"]) for row in rows])
-        return {"dataset": "consumption.csv", "rows": len(rows)}, payload
-    if name == "create_and_plan_job":
-        job = JobInput(recipe_id=data.recipe_id, quantity=data.quantity, planned_on=data.planned_date)
-        recipe = inv.recipe_for_plan(db, user, job)
-        if not re.match(
-            r"^\s*(?:пожалуйста[, ]+)?(?:запланиру(?:й|йте)|созда(?:й|йте)|спланиру(?:й|йте))\b",
-            question,
-            re.IGNORECASE,
-        ):
-            raise DomainError("Для планирования сформулируйте прямую просьбу", 422)
-        if db.get(PendingAction, message_id):
-            raise DomainError("Для ответа уже подготовлено предложение")
-        args = job.model_dump(mode="json")
-        db.add(
-            PendingAction(
-                message_id=message_id,
-                args=args,
-                recipe=recipe.name,
-                expires=datetime.now(UTC) + timedelta(minutes=30),
-            )
-        )
-        return {"proposal": {"recipe": recipe.name, **args}}, None
-    if not re.match(r"^\s*(?:запомни|сохрани)\b", question, re.IGNORECASE):
-        raise DomainError("Укажите явно, какое предпочтение нужно запомнить", 422)
-    if data.key == "currency" and data.value not in {"RUB", "EUR", "USD"}:
-        raise DomainError("Валюта должна быть RUB, EUR или USD", 422)
-    if db.get(PendingAction, message_id):
-        raise DomainError("Для ответа уже подготовлено предложение")
-    args = data.model_dump(mode="json")
-    db.add(
-        PendingAction(
-            message_id=message_id,
-            args=args,
-            recipe="",
-            action="remember_preference",
-            expires=datetime.now(UTC) + timedelta(minutes=30),
-        )
-    )
-    return {"pending_preference": args}, None
-
-
 def context(db: Session, user_id: int, key: int, day: date) -> tuple[Pseudonyms, str, list[dict]]:
     aliases = Pseudonyms(db)
-    facts = [{"key": row.key, "value": aliases.mask(row.value)} for row in preferences(db, user_id)]
+    facts = [{"key": row.key, "value": aliases.mask(row.value)} for row in memory.preferences(db, user_id)]
     materials = [
         inv.serialize(row) for row in db.scalars(select(inv.Material).order_by(inv.Material.code).limit(200))
     ]
@@ -396,16 +247,7 @@ async def generate(
         offline = settings.ai_provider == "fake"
         provider = provider or (FakeProvider() if offline else OpenAIProvider())
         models = ("demo",) if offline else (settings.primary_model, settings.fallback_model)
-        tools = [
-            {
-                "type": "function",
-                "name": name,
-                "description": description,
-                "parameters": schema.model_json_schema(),
-                "strict": False,
-            }
-            for name, (schema, description) in TOOLS.items()
-        ]
+        tools = registry.specs()
         if attachment:
             files.append(await provider.upload("attachment.csv", attachment))
         for _ in range(8):
@@ -427,7 +269,9 @@ async def generate(
                         if not boundary:
                             continue
                         chunk, pending = pending[:boundary], pending[boundary:]
-                        if guarded or numbers(chunk):
+                        # Stream at once when every number is already backed by a tool result;
+                        # otherwise hold the rest of the round until interpreter logs arrive.
+                        if guarded or not supported(numbers(chunk), evidence):
                             guarded += chunk
                         else:
                             shown = aliases.restore(chunk)
@@ -441,7 +285,7 @@ async def generate(
             pending = ""
             evidence.update(interpreter_numbers(output))
             if guarded:
-                if not numbers(guarded).issubset(evidence):
+                if not supported(numbers(guarded), evidence):
                     body = body[:round_start]
                     yield {"type": "reset", "text": body, "retry": False}
                     guarded = "Не удалось подтвердить числовые данные по результатам инструментов."
@@ -475,7 +319,7 @@ async def generate(
                 status = "complete"
                 break
             for call in calls:
-                name = call["name"] if call["name"] in TOOLS else "unknown"
+                name = call["name"] if call["name"] in registry.REGISTRY else "unknown"
                 ordinal += 1
                 await record_tool(message_id, ordinal, name, active_model, "interrupted")
                 yield {"type": "tool", "name": name}
@@ -483,7 +327,7 @@ async def generate(
                     async with AsyncSessionLocal.begin() as db:
                         actor = await db.get(User, user_id)
                         result, dataset = await db.run_sync(
-                            invoke, actor, message_id, question, name, call["arguments"], today
+                            registry.invoke, actor, message_id, question, name, call["arguments"], today
                         )
                 except DomainError as exc:
                     result, dataset = {"error": str(exc)}, None

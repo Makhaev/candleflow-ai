@@ -162,3 +162,19 @@ async def test_stopped_message_retains_text(db, monkeypatch):
     await response.aclose()
     saved = db.get(Message, key, populate_existing=True)
     assert saved.body and saved.status == "interrupted"
+
+
+def test_proposal_previews_reservation_before_confirmation(db):
+    prepare(db)
+    with TestClient(app) as client:
+        sign_in(client, "manager")
+        key = dialog(client)
+        answer = ask(client, key, "Можешь запланировать 10 свечей Лаванда на 2026-12-01?")
+        (row,) = answer["proposal"]["preview"]
+        assert (row["code"], row["required"], row["free"], row["missing"]) == ("SOY", "10", "7", "3")
+        assert "не хватит: Соевый воск — 3 кг" in answer["body"]
+        assert db.scalar(select(func.count()).select_from(Job)) == 0
+        job = client.post(f"/api/messages/{answer['id']}/confirm").json()
+        assert job["components"][0]["missing"] == "3"
+        confirmed = client.get(f"/api/conversations/{key}").json()["messages"][-1]["proposal"]
+        assert confirmed["job_id"] == job["id"] and confirmed["preview"] is None

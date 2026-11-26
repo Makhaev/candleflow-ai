@@ -1,20 +1,15 @@
-from datetime import UTC, datetime, timedelta
+"""Outbox dispatcher: sends completion reports to the marking service with retries."""
+
+from datetime import datetime, timedelta
 
 import httpx
-from celery import Celery
 from sqlalchemy import func, select
 
 from candleflow.config import settings
 from candleflow.db import SessionLocal
 from candleflow.models import Attempt, Outbox
 
-celery = Celery("candleflow", broker=settings.redis_url)
-celery.conf.update(
-    task_ignore_result=True,
-    task_serializer="json",
-    accept_content=["json"],
-    beat_schedule={"dispatch-marking": {"task": "marking.dispatch", "schedule": 3}},
-)
+BATCH = 10
 
 
 def deliver_one(client: httpx.Client, now: datetime) -> bool:
@@ -52,9 +47,10 @@ def deliver_one(client: httpx.Client, now: datetime) -> bool:
     return True
 
 
-@celery.task(name="marking.dispatch")
-def dispatch() -> None:
+def dispatch_due(now_factory) -> int:
+    """Deliver up to BATCH due reports; returns how many were attempted."""
+    sent = 0
     with httpx.Client() as client:
-        for _ in range(10):
-            if not deliver_one(client, datetime.now(UTC)):
-                break
+        while sent < BATCH and deliver_one(client, now_factory()):
+            sent += 1
+    return sent

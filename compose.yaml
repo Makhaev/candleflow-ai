@@ -1,11 +1,18 @@
+name: candleflow
+
 x-backend: &backend
+  # No shared image tag: several services building one tag in parallel fails in BuildKit.
+  # Layers are cached, so the backend is still built only once.
   build: .
-  image: candleflow-backend:local
   environment: &backend-env
     DATABASE_URL: postgresql+psycopg://candleflow:candleflow@db:5432/candleflow
     REDIS_URL: redis://redis:6379/0
     RATES_URL: http://rates:8003
     MARKING_URL: http://marking:8001
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+    DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+    RATE_LIMITS: ${RATE_LIMITS:-true}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 services:
   db:
@@ -16,6 +23,7 @@ services:
       POSTGRES_DB: candleflow
     volumes:
       - postgres:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U candleflow -d candleflow"]
       interval: 2s
@@ -23,6 +31,7 @@ services:
       retries: 25
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -42,32 +51,44 @@ services:
       PRIMARY_MODEL: ${PRIMARY_MODEL:-gpt-5.4-mini}
       FALLBACK_MODEL: ${FALLBACK_MODEL:-gpt-6-luna}
       LLM_TIMEOUT: ${LLM_TIMEOUT:-45}
+      # uvicorn reads WEB_CONCURRENCY as the number of worker processes.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
     depends_on:
       rates: { condition: service_started }
       init: { condition: service_completed_successfully }
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
   rates:
     <<: *backend
     command: ["uvicorn", "candleflow.rate_mock:app", "--host", "0.0.0.0", "--port", "8003"]
+    restart: unless-stopped
   marking:
     <<: *backend
     command: ["uvicorn", "candleflow.marking_mock:app", "--host", "0.0.0.0", "--port", "8001"]
+    restart: unless-stopped
     depends_on:
       init: { condition: service_completed_successfully }
   worker:
     <<: *backend
-    command: ["celery", "-A", "candleflow.marking:celery", "worker", "--beat", "--concurrency=2", "--schedule=/tmp/candleflow-beat", "--loglevel=WARNING"]
+    command: ["celery", "-A", "candleflow.worker:celery", "worker", "--beat", "--concurrency=2", "--schedule=/tmp/candleflow-beat", "--loglevel=WARNING"]
     depends_on:
       init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       marking: { condition: service_started }
+    restart: unless-stopped
   frontend:
     build: ./frontend
     ports:
       - "127.0.0.1:8080:80"
     depends_on:
-      - api
+      api: { condition: service_healthy }
+    restart: unless-stopped
 
 volumes:
   postgres:

@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     primary_model: str = "gpt-5.4-mini"
     fallback_model: str = "gpt-6-luna"
     llm_timeout: int = 45
+    # Per API process. Keep processes x (size + overflow) below PostgreSQL max_connections.
+    db_pool_size: int = 10
+    db_max_overflow: int = 5
+    rate_limits: bool = True
+    log_level: str = "INFO"
 
 
 settings = Settings()
